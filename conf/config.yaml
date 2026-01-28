@@ -1,0 +1,89 @@
+# StateVLA Configuration
+
+# ============= Data Configuration =============
+data:
+  data_directory: "/path/to/your/data"  # Change this to your data path
+  demos_per_task: 50
+  max_len_data: 260
+  train_split: 0.9
+
+# ============= Model Configuration =============
+model:
+  # Vision Encoder
+  image_encoder_type: "resnet"  # resnet or eagle
+  latent_dim: 256
+
+  # Language Encoder
+  use_language_encoder: true
+  freeze_language_encoder: true
+  clip_model_name: "ViT-B/32"
+  lang_emb_dim: 512
+
+  # State Configuration (StateVLA specific)
+  state_dim: 256
+  state_predictor_layers: 4
+
+  # Action Configuration
+  action_dim: 7
+  action_seq_len: 10
+  obs_tok_len: 2
+
+  # Policy Configuration
+  policy_layers: 3
+  policy_embed_dim: 256
+  use_correction: true  # Enable residual correction
+
+  # General
+  dropout: 0.1
+
+# ============= Training Configuration =============
+training:
+  batch_size: 64
+  num_epochs: 2000
+  learning_rate: 1.0e-4
+  weight_decay: 0.05
+  gradient_clip: 1.0
+
+  # Loss weights
+  action_loss_weight: 1.0
+  state_loss_weight: 0.1
+
+  # EMA
+  enable_ema: true
+  ema_decay_rate: 0.995
+
+  # Data scaling
+  enable_data_scaling: true
+  data_scaler_type: "minmax"
+
+  # Flow Matching
+  sampling_steps: 4
+  use_ln_timestep: false
+
+  # Checkpointing
+  save_interval: 100
+  checkpoint_dir: "checkpoints"
+
+  # Logging
+  log_interval: 10
+  use_wandb: false
+  wandb_project: "statevla"
+  wandb_entity: null
+
+# ============= Evaluation Configuration =============
+evaluation:
+  eval_during_training: true
+  eval_interval: 100
+  eval_num_rollouts: 5
+  eval_max_steps: 400
+
+# ============= Camera Configuration =============
+cameras:
+  names:
+    - "agentview"
+    - "eye_in_hand"
+  image_size: 128
+
+# ============= Device Configuration =============
+device: "cuda"  # cuda or cpu
+seed: 42

@@ -1,0 +1,104 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-*
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data and Datasets (large files)
+data/
+datasets/
+*.hdf5
+*.h5
+*.pkl
+*.npy
+*.npz
+
+# Checkpoints and Model Weights (large files)
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+
+# LIBERO (external library - clone separately)
+LIBERO/
+
+# Huggingface cache
+.cache/
+huggingface/
+
+# Logs and Outputs
+logs/
+wandb/
+outputs/
+*.log
+runs/
+tensorboard/
+
+# OS
+.DS_Store
+Thumbs.db
+*.bak
+*.tmp
+
+# Temporary files
+*.swp
+*~
+\#*\#
+
+# Environment variables (security)
+.env
+.env.local
+*.env
+
+# Large language model files
+*.gguf
+*.ggml
+
+# Compiled files
+*.o
+*.a
+*.dylib
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# mypy
+.mypy_cache/
