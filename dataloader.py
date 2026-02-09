@@ -31,6 +31,7 @@ class StateVLADataset(Dataset):
       - Actions
 
     Supports sequence-based sampling for state prediction.
+    Supports multi-step rollout for JEPA-style training.
     """
 
     def __init__(
@@ -45,7 +46,8 @@ class StateVLADataset(Dataset):
         start_idx: int = 0,
         demos_per_task: int = 50,
         image_size: int = 224,
-        camera_names: List[str] = None
+        camera_names: List[str] = None,
+        max_rollout_steps: int = 5
     ):
         """
         Args:
@@ -71,6 +73,7 @@ class StateVLADataset(Dataset):
         self.demos_per_task = demos_per_task
         self.image_size = image_size
         self.camera_names = camera_names or ['agentview', 'eye_in_hand']
+        self.max_rollout_steps = max_rollout_steps
 
         log.info(f"Loading dataset from {data_directory}")
 
@@ -82,6 +85,9 @@ class StateVLADataset(Dataset):
 
         # Create sample slices
         self.slices = self._get_slices()
+
+        # Compute action normalization statistics
+        self._compute_action_stats()
 
         log.info(f"Loaded {self.num_data} trajectories, {len(self.slices)} samples")
 
@@ -202,6 +208,59 @@ class StateVLADataset(Dataset):
             result.append(self.actions[i, :T, :])
         return torch.cat(result, dim=0)
 
+    def _compute_action_stats(self):
+        """Compute action normalization statistics (mean, std) for pos/rot only."""
+        all_actions = self.get_all_actions()
+
+        # Only normalize position/rotation (first 6 dims), not gripper
+        pos_rot_actions = all_actions[:, :6]
+
+        self.action_mean = pos_rot_actions.mean(dim=0)  # [6]
+        self.action_std = pos_rot_actions.std(dim=0)    # [6]
+
+        # Prevent division by zero
+        self.action_std = torch.clamp(self.action_std, min=1e-6)
+
+        log.info(f"Action stats - mean: {self.action_mean.numpy()}")
+        log.info(f"Action stats - std: {self.action_std.numpy()}")
+
+    def normalize_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        """
+        Normalize actions (pos/rot only, gripper unchanged).
+
+        Args:
+            actions: [B, seq_len, 7] or [seq_len, 7]
+
+        Returns:
+            normalized actions
+        """
+        normalized = actions.clone()
+        # Normalize only pos/rot (first 6 dims)
+        normalized[..., :6] = (actions[..., :6] - self.action_mean.to(actions.device)) / self.action_std.to(actions.device)
+        return normalized
+
+    def denormalize_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        """
+        Denormalize actions (pos/rot only, gripper unchanged).
+
+        Args:
+            actions: [B, seq_len, 7] or [seq_len, 7]
+
+        Returns:
+            denormalized actions
+        """
+        denormalized = actions.clone()
+        # Denormalize only pos/rot (first 6 dims)
+        denormalized[..., :6] = actions[..., :6] * self.action_std.to(actions.device) + self.action_mean.to(actions.device)
+        return denormalized
+
+    def get_action_stats(self) -> Dict[str, torch.Tensor]:
+        """Get action normalization statistics."""
+        return {
+            'mean': self.action_mean,
+            'std': self.action_std
+        }
+
     def __len__(self) -> int:
         return len(self.slices)
 
@@ -261,7 +320,8 @@ class StateVLADataset(Dataset):
 
         # Get next observation for state prediction loss
         next_obs = None
-        if start + 1 < self._get_seq_length(i):
+        seq_length = self._get_seq_length(i)
+        if start + 1 < seq_length:
             next_agentview = self.agentview_rgb[i][start + 1:start + 2]
             next_eye_in_hand = self.eye_in_hand_rgb[i][start + 1:start + 2]
 
@@ -281,12 +341,54 @@ class StateVLADataset(Dataset):
                 "robot_states": next_robot_state.squeeze(0)
             }
 
+        # Get future observations for multi-step rollout (JEPA)
+        future_obs_list = []
+        future_valid_mask = []
+        for step in range(1, self.max_rollout_steps + 1):
+            future_idx = start + step
+            if future_idx < seq_length:
+                future_agentview = self.agentview_rgb[i][future_idx:future_idx + 1]
+                future_eye_in_hand = self.eye_in_hand_rgb[i][future_idx:future_idx + 1]
+
+                future_agentview = torch.from_numpy(future_agentview).float().permute(0, 3, 1, 2) / 255.0
+                future_eye_in_hand = torch.from_numpy(future_eye_in_hand).float().permute(0, 3, 1, 2) / 255.0
+
+                future_agentview = TF.resize(future_agentview, [self.image_size, self.image_size], antialias=True)
+                future_eye_in_hand = TF.resize(future_eye_in_hand, [self.image_size, self.image_size], antialias=True)
+
+                future_robot_state = torch.from_numpy(self.robot_states[i][future_idx:future_idx + 1]).float()
+
+                future_obs = {
+                    "agentview_image": future_agentview.squeeze(0),
+                    "eye_in_hand_image": future_eye_in_hand.squeeze(0),
+                    "lang_emb": task_emb,
+                    "robot_states": future_robot_state.squeeze(0)
+                }
+                future_obs_list.append(future_obs)
+                future_valid_mask.append(1.0)
+            else:
+                # Padding with zeros for invalid future steps
+                future_obs = {
+                    "agentview_image": torch.zeros_like(obs["agentview_image"]),
+                    "eye_in_hand_image": torch.zeros_like(obs["eye_in_hand_image"]),
+                    "lang_emb": task_emb,
+                    "robot_states": torch.zeros_like(obs["robot_states"])
+                }
+                future_obs_list.append(future_obs)
+                future_valid_mask.append(0.0)
+
+        # Normalize actions (pos/rot only, gripper unchanged)
+        actions_normalized = self.normalize_actions(actions)
+        prev_action_normalized = self.normalize_actions(prev_action.unsqueeze(0)).squeeze(0)
+
         return {
             "obs": obs,
-            "actions": actions,
-            "prev_action": prev_action,
+            "actions": actions_normalized,
+            "prev_action": prev_action_normalized,
             "mask": mask,
-            "next_obs": next_obs
+            "next_obs": next_obs,
+            "future_obs_list": future_obs_list,
+            "future_valid_mask": torch.tensor(future_valid_mask, dtype=torch.float32)
         }
 
 
@@ -341,10 +443,25 @@ def collate_fn(batch: List[Dict]) -> Dict:
             values = [b["next_obs"][key] if b["next_obs"] is not None else b["obs"][key] for b in batch]
             next_obs_batch[key] = torch.stack(values)
 
+    # Collect future observations for multi-step rollout (JEPA)
+    future_obs_list_batch = None
+    future_valid_mask_batch = None
+    if "future_obs_list" in batch[0] and batch[0]["future_obs_list"]:
+        num_steps = len(batch[0]["future_obs_list"])
+        future_obs_list_batch = []
+        for step in range(num_steps):
+            step_obs = {}
+            for key in obs_keys:
+                step_obs[key] = torch.stack([b["future_obs_list"][step][key] for b in batch])
+            future_obs_list_batch.append(step_obs)
+        future_valid_mask_batch = torch.stack([b["future_valid_mask"] for b in batch])
+
     return {
         "obs": obs_batch,
         "actions": torch.stack([b["actions"] for b in batch]),
         "prev_action": torch.stack([b["prev_action"] for b in batch]),
         "mask": torch.stack([b["mask"] for b in batch]),
-        "next_obs": next_obs_batch if has_next_obs else None
+        "next_obs": next_obs_batch if has_next_obs else None,
+        "future_obs_list": future_obs_list_batch,
+        "future_valid_mask": future_valid_mask_batch
     }

@@ -67,6 +67,7 @@ outputs/
 *.log
 runs/
 tensorboard/
+rollouts/
 
 # OS
 .DS_Store

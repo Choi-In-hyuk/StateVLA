@@ -1,5 +1,5 @@
-# StateVLA Configuration for LIBERO-Object
-# Using Eagle2-VLM vision encoder and Qwen-7B-Chat language encoder
+# StateVLA JEPA Configuration for LIBERO-Object
+# Uses pretrained SigLIP (vision) encoder
 
 # ============= Data Configuration =============
 data:
@@ -10,87 +10,89 @@ data:
 
 # ============= Model Configuration =============
 model:
-  # Vision Encoder (Eagle2-VLM)
-  image_encoder_type: "eagle2"  # eagle2, resnet, or siglip
-  eagle2_model_name: "nvidia/Eagle2-1B"  # Eagle2-1B, Eagle2-2B, or Eagle2-9B
-  freeze_vision_encoder: true
-  latent_dim: 256
+  # Tokenizer Configuration
+  image_size: 224
+  patch_size: 16  # 14x14 = 196 patches per image
+  embed_dim: 256
 
-  # Language Encoder (Qwen)
-  language_encoder_type: "qwen"  # qwen or clip
-  qwen_model_name: "Qwen/Qwen2-7B-Instruct"  # Qwen2-7B-Instruct
-  use_language_encoder: true
-  freeze_language_encoder: true
-  lang_emb_dim: 3584  # Qwen2-7B hidden size
+  # Language
+  lang_emb_dim: 3584  # Qwen embedding dimension (from dataloader)
 
-  # CLIP fallback settings (if using clip encoder)
-  clip_model_name: "ViT-B/32"
+  # Robot State
+  robot_state_dim: 9  # joint_states(7) + gripper_states(2)
 
-  # State Configuration (StateVLA specific)
-  state_encoder_type: "mlp"  # mlp or cross_attention
+  # Pretrained Encoder Configuration
+  use_pretrained_vision: true
+  use_pretrained_language: false  # Use pre-computed embeddings from dataloader
+  vision_model_name: "google/siglip-base-patch16-224"
+  language_model_name: "ViT-B/32"
+  freeze_vision: true
+  freeze_language: true
+
+  # Mamba Encoder Configuration (State Space Model)
+  encoder_depth: 12
+  d_state: 16
+  d_conv: 4
+  expand: 2
+
+  # JEPA Predictor Configuration
+  predictor_embed_dim: 192
+  predictor_depth: 6
+
+  # Masking Configuration
+  mask_ratio: 0.5
+  masking_strategy: "modality_aware"  # modality_aware, random, block
+
+  # State Configuration
   state_dim: 256
-  state_predictor_layers: 4
 
   # Action Configuration
   action_dim: 7
-  action_seq_len: 10
-  obs_tok_len: 2
+  action_seq_len: 8  # Reduced from 10 for more responsive actions
 
-  # Policy Configuration
+  # Action Policy Configuration
   policy_layers: 3
   policy_embed_dim: 256
-  use_correction: true  # Enable residual correction
-
-  # General
-  dropout: 0.1
 
 # ============= Training Configuration =============
 training:
-  batch_size: 32  # Reduced due to larger models
-  num_epochs: 50  # Reduced from 2000 for practical training time
+  batch_size: 256
+  num_epochs: 2000  # Increased for better convergence
   learning_rate: 1.0e-4
   weight_decay: 0.05
   gradient_clip: 1.0
 
-  # Loss weights
+  # JEPA Loss Configuration
+  jepa_loss_weight: 1.0
   action_loss_weight: 1.0
-  state_loss_weight: 0.1
 
-  # EMA
-  enable_ema: true
-  ema_decay_rate: 0.995
+  # VICReg Regularization Weights
+  variance_weight: 1.0
+  covariance_weight: 0.04
 
-  # Data scaling
-  enable_data_scaling: true
-  data_scaler_type: "minmax"
+  # EMA Target Encoder Configuration
+  ema_momentum: 0.996
+  ema_momentum_schedule: "cosine"  # constant or cosine
+
+  # Learning Rate Scheduler
+  use_lr_scheduler: true
+  min_lr: 1.0e-6
 
   # Flow Matching
   sampling_steps: 4
-  use_ln_timestep: false
 
   # Checkpointing
-  save_interval: 5  # Save every 5 epochs for practical training
+  save_interval: 50
   checkpoint_dir: "checkpoints/libero_object"
 
   # Logging
   log_interval: 10
-  use_wandb: false
-  wandb_project: "statevla-libero"
-  wandb_entity: null
-
-# ============= Evaluation Configuration =============
-evaluation:
-  eval_during_training: true
-  eval_interval: 100
-  eval_num_rollouts: 5
-  eval_max_steps: 400
 
 # ============= Camera Configuration =============
 cameras:
   names:
     - "agentview"
     - "eye_in_hand"
-  image_size: 384  # Larger for Eagle2
 
 # ============= Device Configuration =============
 device: "cuda"  # cuda or cpu

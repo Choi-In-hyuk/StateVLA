@@ -63,6 +63,7 @@ def create_statevla_model(
     lang_emb_dim: int = 512,
     state_encoder_type: str = 'mlp',
     state_dim: int = 256,
+    robot_state_dim: int = 8,  # joint_states(7) + gripper_states(1)
     action_dim: int = 7,
     action_seq_len: int = 10,
     # Architecture configs
@@ -173,6 +174,7 @@ def create_statevla_model(
         obs_tok_len=obs_tok_len,
         state_encoder_type=state_encoder_type,
         state_dim=state_dim,
+        robot_state_dim=robot_state_dim,
         state_predictor_layers=state_predictor_layers,
         action_dim=action_dim,
         action_seq_len=action_seq_len,
@@ -197,6 +199,7 @@ def create_statevla_core(
     latent_dim: int = 256,
     lang_emb_dim: int = 512,
     state_dim: int = 256,
+    robot_state_dim: int = 8,
     action_dim: int = 7,
     action_seq_len: int = 10,
     obs_tok_len: int = 2,
@@ -220,6 +223,7 @@ def create_statevla_core(
         lang_emb_dim=lang_emb_dim,
         obs_tok_len=obs_tok_len,
         state_dim=state_dim,
+        robot_state_dim=robot_state_dim,
         state_predictor_layers=state_predictor_layers,
         action_dim=action_dim,
         action_seq_len=action_seq_len,

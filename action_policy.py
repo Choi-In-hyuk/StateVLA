@@ -21,18 +21,72 @@ from mamba import MixerModel
 from utils import MLP, TimeEmbedding
 
 
+class GripperClassifier(nn.Module):
+    """
+    Binary classifier for gripper action (open/close).
+    Separate from Flow Matching to handle discrete nature of gripper.
+    """
+
+    def __init__(
+        self,
+        state_dim: int = 256,
+        action_seq_len: int = 10,
+        hidden_dim: int = 256,
+    ):
+        super().__init__()
+
+        self.action_seq_len = action_seq_len
+
+        self.classifier = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, action_seq_len),  # Output logits for each timestep
+        )
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        Predict gripper logits.
+
+        Args:
+            z: [B, state_dim] state representation
+
+        Returns:
+            logits: [B, action_seq_len] gripper logits (>0 = close, <0 = open)
+        """
+        return self.classifier(z)
+
+    def predict(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        Predict gripper actions as binary values.
+
+        Args:
+            z: [B, state_dim] state representation
+
+        Returns:
+            gripper: [B, action_seq_len, 1] gripper actions (-1 or 1)
+        """
+        logits = self.forward(z)
+        # Convert to -1 (open) or 1 (close)
+        gripper = torch.where(logits > 0, torch.ones_like(logits), -torch.ones_like(logits))
+        return gripper.unsqueeze(-1)  # [B, action_seq_len, 1]
+
+
 class FlowMatchingPolicy(nn.Module):
     """
     Flow Matching based policy for action generation.
 
     Takes the predicted next state and generates base actions
     using a diffusion-style flow matching approach.
+
+    Note: Only handles position/rotation (6 dims), gripper is separate.
     """
 
     def __init__(
         self,
         state_dim: int = 256,
-        action_dim: int = 7,
+        action_dim: int = 6,  # Changed from 7 to 6 (no gripper)
         action_seq_len: int = 10,
         embed_dim: int = 256,
         n_layer: int = 3,
@@ -43,7 +97,7 @@ class FlowMatchingPolicy(nn.Module):
         super().__init__()
 
         self.state_dim = state_dim
-        self.action_dim = action_dim
+        self.action_dim = action_dim  # 6 (position + rotation, no gripper)
         self.action_seq_len = action_seq_len
         self.embed_dim = embed_dim
 
@@ -240,16 +294,17 @@ class ActionPolicy(nn.Module):
     """
     Residual Action Policy combining Flow Matching base and MLP correction.
 
-    Final action: a = a_base + Δa
-    where:
-      - a_base comes from FlowMatchingPolicy(z_{t+1}^pred)
-      - Δa comes from CorrectionMLP(z_t, error)
+    Architecture:
+      - Position/Rotation (6 dims): Flow Matching + optional correction
+      - Gripper (1 dim): Binary classifier (separate head)
+
+    Final action: a = [a_pos_rot, a_gripper]
     """
 
     def __init__(
         self,
         state_dim: int = 256,
-        action_dim: int = 7,
+        action_dim: int = 7,  # Total action dim (6 pos/rot + 1 gripper)
         action_seq_len: int = 10,
         embed_dim: int = 256,
         n_layer: int = 3,
@@ -262,14 +317,16 @@ class ActionPolicy(nn.Module):
         super().__init__()
 
         self.state_dim = state_dim
-        self.action_dim = action_dim
+        self.action_dim = action_dim  # 7 total
+        self.pos_rot_dim = 6  # Position + Rotation
+        self.gripper_dim = 1  # Gripper
         self.action_seq_len = action_seq_len
         self.use_correction = use_correction
 
-        # Base policy: Flow Matching
+        # Base policy: Flow Matching for position/rotation only
         self.base_policy = FlowMatchingPolicy(
             state_dim=state_dim,
-            action_dim=action_dim,
+            action_dim=self.pos_rot_dim,  # 6 dims only
             action_seq_len=action_seq_len,
             embed_dim=embed_dim,
             n_layer=n_layer,
@@ -278,11 +335,18 @@ class ActionPolicy(nn.Module):
             device=device
         )
 
-        # Correction MLP
+        # Gripper classifier (separate binary head)
+        self.gripper_head = GripperClassifier(
+            state_dim=state_dim,
+            action_seq_len=action_seq_len,
+            hidden_dim=embed_dim,
+        )
+
+        # Correction MLP for position/rotation
         if use_correction:
             self.correction = CorrectionMLP(
                 state_dim=state_dim,
-                action_dim=action_dim,
+                action_dim=self.pos_rot_dim,  # 6 dims only
                 action_seq_len=action_seq_len,
                 hidden_dim=correction_hidden_dim
             )
@@ -299,7 +363,7 @@ class ActionPolicy(nn.Module):
         error: torch.Tensor,
         noisy_actions: torch.Tensor,
         sigma: torch.Tensor
-    ) -> torch.Tensor:
+    ) -> tuple:
         """
         Forward pass for training.
 
@@ -307,21 +371,28 @@ class ActionPolicy(nn.Module):
             z_t: [B, state_dim] current state
             z_next_pred: [B, state_dim] predicted next state
             error: [B, state_dim] prediction error
-            noisy_actions: [B, action_seq_len, action_dim] noisy actions
+            noisy_actions: [B, action_seq_len, action_dim] noisy actions (7 dims)
             sigma: [B] diffusion timestep
 
         Returns:
-            velocity: [B, action_seq_len, action_dim] predicted velocity
+            velocity: [B, action_seq_len, 6] predicted velocity for pos/rot
+            gripper_logits: [B, action_seq_len] gripper logits
         """
-        # Base policy velocity
-        velocity = self.base_policy(z_next_pred, noisy_actions, sigma)
+        # Extract position/rotation part of noisy actions (first 6 dims)
+        noisy_pos_rot = noisy_actions[:, :, :self.pos_rot_dim]
+
+        # Base policy velocity for position/rotation
+        velocity = self.base_policy(z_next_pred, noisy_pos_rot, sigma)
 
         # Add correction if enabled
         if self.use_correction and self.correction is not None:
             delta_a = self.correction(z_t, error)
             velocity = velocity + self.correction_weight * delta_a
 
-        return velocity
+        # Gripper classification (separate head)
+        gripper_logits = self.gripper_head(z_t)
+
+        return velocity, gripper_logits
 
     @torch.no_grad()
     def generate_actions(
@@ -341,29 +412,39 @@ class ActionPolicy(nn.Module):
             sample_steps: number of denoising steps
 
         Returns:
-            actions: [B, action_seq_len, action_dim] generated actions
+            actions: [B, action_seq_len, action_dim] generated actions (7 dims)
         """
         batch_size = z_t.shape[0]
         device = z_t.device
 
-        # Start from noise
-        actions = torch.randn(
-            batch_size, self.action_seq_len, self.action_dim,
+        # Start from noise for position/rotation only
+        pos_rot_actions = torch.randn(
+            batch_size, self.action_seq_len, self.pos_rot_dim,  # 6 dims
             device=device
         )
 
-        # Iterative denoising
+        # Iterative denoising for position/rotation
         step_size = 1.0 / sample_steps
 
         for i in range(sample_steps, 0, -1):
             t = i / sample_steps
             sigma = torch.full((batch_size,), t, device=device)
 
-            # Predict velocity with correction
-            velocity = self.forward(z_t, z_next_pred, error, actions, sigma)
+            # Create dummy full actions for forward pass
+            dummy_gripper = torch.zeros(batch_size, self.action_seq_len, 1, device=device)
+            full_actions = torch.cat([pos_rot_actions, dummy_gripper], dim=-1)
 
-            # Update actions (Euler step)
-            actions = actions - step_size * velocity
+            # Predict velocity (only for pos/rot)
+            velocity, _ = self.forward(z_t, z_next_pred, error, full_actions, sigma)
+
+            # Update pos/rot actions (Euler step)
+            pos_rot_actions = pos_rot_actions - step_size * velocity
+
+        # Get gripper prediction (binary classification)
+        gripper_actions = self.gripper_head.predict(z_t)  # [B, action_seq_len, 1]
+
+        # Combine position/rotation and gripper
+        actions = torch.cat([pos_rot_actions, gripper_actions], dim=-1)  # [B, seq_len, 7]
 
         return actions
 
@@ -393,21 +474,27 @@ class ActionFlowMatching(nn.Module):
         error: torch.Tensor
     ) -> tuple:
         """
-        Compute flow matching loss.
+        Compute flow matching loss for pos/rot and BCE loss for gripper.
 
         Args:
-            actions: [B, action_seq_len, action_dim] ground truth actions
+            actions: [B, action_seq_len, action_dim] ground truth actions (7 dims)
             z_t: [B, state_dim] current state
             z_next_pred: [B, state_dim] predicted next state
             error: [B, state_dim] prediction error
 
         Returns:
-            loss: scalar loss value
-            time_loss_pairs: list of (timestep, loss) for analysis
+            total_loss: combined loss (pos_rot + gripper)
+            pos_rot_loss: position/rotation flow matching loss
+            gripper_loss: gripper BCE loss
         """
         batch_size = actions.shape[0]
         device = actions.device
 
+        # Split actions into pos/rot and gripper
+        pos_rot_actions = actions[:, :, :6]  # [B, seq_len, 6]
+        gripper_actions = actions[:, :, 6]   # [B, seq_len]
+
+        # --- Position/Rotation Flow Matching Loss ---
         # Sample timesteps
         if self.ln:
             noise_t = torch.randn((batch_size,), device=device)
@@ -418,26 +505,38 @@ class ActionFlowMatching(nn.Module):
         # Expand for broadcasting
         time_expanded = time_steps.view([batch_size, 1, 1])
 
-        # Sample noise
-        noise = torch.randn_like(actions)
+        # Sample noise for pos/rot only
+        noise = torch.randn_like(pos_rot_actions)
 
         # Interpolate: x_t = (1 - t) * x_0 + t * noise
-        interpolated = (1 - time_expanded) * actions + time_expanded * noise
+        interpolated_pos_rot = (1 - time_expanded) * pos_rot_actions + time_expanded * noise
 
-        # Predict velocity
-        velocity_pred = self.policy(z_t, z_next_pred, error, interpolated, time_steps)
+        # Add dummy gripper for full action tensor
+        dummy_gripper = torch.zeros(batch_size, actions.shape[1], 1, device=device)
+        interpolated = torch.cat([interpolated_pos_rot, dummy_gripper], dim=-1)
 
-        # Target velocity: noise - actions (the direction from clean to noisy)
-        target_velocity = noise - actions
+        # Predict velocity and gripper logits
+        velocity_pred, gripper_logits = self.policy(z_t, z_next_pred, error, interpolated, time_steps)
 
-        # MSE loss
-        batchwise_mse = ((target_velocity - velocity_pred) ** 2).mean(dim=[1, 2])
-        loss = batchwise_mse.mean()
+        # Target velocity for pos/rot: noise - actions
+        target_velocity = noise - pos_rot_actions
 
-        # Time-loss pairs for analysis
-        time_loss_pairs = list(zip(time_steps.cpu().numpy(), batchwise_mse.detach().cpu().numpy()))
+        # MSE loss for pos/rot
+        pos_rot_loss = ((target_velocity - velocity_pred) ** 2).mean()
 
-        return loss, time_loss_pairs
+        # --- Gripper BCE Loss ---
+        # Convert gripper actions from {-1, 1} to {0, 1} for BCE
+        gripper_targets = (gripper_actions > 0).float()  # [B, seq_len]
+
+        # BCE loss
+        gripper_loss = nn.functional.binary_cross_entropy_with_logits(
+            gripper_logits, gripper_targets
+        )
+
+        # Combined loss
+        total_loss = pos_rot_loss + gripper_loss
+
+        return total_loss, pos_rot_loss, gripper_loss
 
     @torch.no_grad()
     def generate_actions(
