@@ -323,6 +323,7 @@ def load_model(checkpoint_path, config_path, device):
 
     # Create model
     model_config = config["model"]
+    training_config = config.get("training", {})
     model = StateVLA(
         camera_names=config["cameras"]["names"],
         image_size=model_config.get("image_size", 224),
@@ -349,6 +350,8 @@ def load_model(checkpoint_path, config_path, device):
         action_seq_len=model_config.get("action_seq_len", 10),
         policy_layers=model_config.get("policy_layers", 3),
         policy_embed_dim=model_config.get("policy_embed_dim", 256),
+        temporal_hidden_dim=training_config.get("phase1", {}).get("temporal_predictor_hidden_dim", 512),
+        training_phase=2,
         device=device,
     )
 

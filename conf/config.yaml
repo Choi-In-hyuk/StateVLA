@@ -1,8 +1,14 @@
-# StateVLA JEPA Configuration
+# StateVLA Two-Phase Training Configuration
+#
+# Phase 1: Temporal JEPA (representation learning)
+#   python train.py --config conf/config.yaml --phase 1
+#
+# Phase 2: Flow Matching (policy learning)
+#   python train.py --config conf/config.yaml --phase 2 --phase1_checkpoint <path>
 
 # ============= Data Configuration =============
 data:
-  data_directory: "/path/to/your/data"  # Change this to your data path
+  data_directory: "/home/choi/choi_ws/openvla/datasets/libero_object"
   demos_per_task: 50
   max_len_data: 260
   train_split: 0.9
@@ -18,7 +24,7 @@ model:
   lang_emb_dim: 512
 
   # Robot State
-  robot_state_dim: 8  # joint_states(7) + gripper_states(1)
+  robot_state_dim: 9  # joint_states(7) + gripper_states(2)
 
   # Mamba Encoder Configuration (State Space Model)
   encoder_depth: 12
@@ -26,13 +32,13 @@ model:
   d_conv: 4
   expand: 2
 
-  # JEPA Predictor Configuration
+  # Legacy JEPA Predictor Configuration (kept for compatibility)
   predictor_embed_dim: 192
   predictor_depth: 6
 
-  # Masking Configuration
+  # Masking Configuration (legacy, not used in temporal JEPA)
   mask_ratio: 0.5
-  masking_strategy: "modality_aware"  # modality_aware, random, block
+  masking_strategy: "modality_aware"
 
   # State Configuration
   state_dim: 256
@@ -48,12 +54,12 @@ model:
 # ============= Training Configuration =============
 training:
   batch_size: 64
-  num_epochs: 2000
+  num_epochs: 2000  # Default, overridden by phase-specific config
   learning_rate: 1.0e-4
   weight_decay: 0.05
   gradient_clip: 1.0
 
-  # JEPA Loss Configuration
+  # Loss Weights
   jepa_loss_weight: 1.0
   action_loss_weight: 1.0
 
@@ -78,6 +84,18 @@ training:
 
   # Logging
   log_interval: 10
+
+  # ---- Phase 1: Temporal JEPA ----
+  phase1:
+    num_epochs: 1000
+    learning_rate: 1.0e-4
+    temporal_predictor_hidden_dim: 512
+
+  # ---- Phase 2: Flow Matching ----
+  phase2:
+    num_epochs: 1000
+    learning_rate: 5.0e-5
+    phase1_checkpoint: null  # Set via --phase1_checkpoint or here
 
 # ============= Camera Configuration =============
 cameras:

@@ -1,9 +1,11 @@
 """
-StateVLA JEPA Training Script
+StateVLA Two-Phase Training Script
 
-Usage:
-    python train.py --config conf/config.yaml
-    python train.py --config conf/config.yaml --data_directory /path/to/data
+Phase 1: Temporal JEPA (representation learning)
+    python train.py --config conf/config.yaml --phase 1
+
+Phase 2: Flow Matching (policy learning)
+    python train.py --config conf/config.yaml --phase 2 --phase1_checkpoint checkpoints/phase1/checkpoint_best.pt
 """
 
 import os
@@ -84,7 +86,7 @@ def save_checkpoint(
         log.info(f"Saved checkpoint at epoch {epoch}")
 
 
-def train_epoch(
+def train_epoch_phase1(
     trainer: StateVLATrainer,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
@@ -94,26 +96,38 @@ def train_epoch(
     global_step: int = 0,
     total_steps: int = 0
 ):
-    """Train for one epoch."""
+    """Train Phase 1: Temporal JEPA."""
     trainer.train()
     total_loss = 0
-    total_action_loss = 0
-    total_jepa_loss = 0
+    total_mse = 0
+    total_var = 0
+    total_cov = 0
     num_batches = 0
     current_step = global_step
 
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
+    pbar = tqdm(dataloader, desc=f"[Phase 1] Epoch {epoch}")
 
     for batch in pbar:
         # Move data to device
         obs = {k: v.to(device) for k, v in batch['obs'].items()}
         actions = batch['actions'].to(device)
 
+        # Get next observation
+        next_obs = batch.get('next_obs')
+        if next_obs is None:
+            # Skip batches without next_obs
+            continue
+        next_obs = {k: v.to(device) for k, v in next_obs.items()}
+
+        # Extract single action at time t (first action in sequence)
+        a_t = actions[:, 0, :]  # [B, action_dim]
+
         # Forward pass
         optimizer.zero_grad()
         outputs = trainer(
             obs_dict=obs,
-            gt_actions=actions,
+            next_obs_dict=next_obs,
+            action=a_t,
             step=current_step,
             total_steps=total_steps,
         )
@@ -139,36 +153,114 @@ def train_epoch(
 
         # Logging
         total_loss += loss.item()
-        total_action_loss += outputs['action_loss'].item()
-        total_jepa_loss += outputs['jepa_loss'].item()
+        total_mse += outputs['jepa_mse'].item()
+        total_var += outputs['jepa_variance'].item()
+        total_cov += outputs['jepa_covariance'].item()
         num_batches += 1
 
         pbar.set_postfix({
             'loss': f"{loss.item():.4f}",
-            'act': f"{outputs['action_loss'].item():.4f}",
-            'jepa': f"{outputs['jepa_loss'].item():.4f}"
+            'mse': f"{outputs['jepa_mse'].item():.4f}",
+            'var': f"{outputs['jepa_variance'].item():.4f}",
         })
 
-    avg_loss = total_loss / num_batches
-    avg_action_loss = total_action_loss / num_batches
-    avg_jepa_loss = total_jepa_loss / num_batches
+    avg_loss = total_loss / max(num_batches, 1)
+    avg_mse = total_mse / max(num_batches, 1)
+    avg_var = total_var / max(num_batches, 1)
+    avg_cov = total_cov / max(num_batches, 1)
 
     return {
         'loss': avg_loss,
-        'action_loss': avg_action_loss,
-        'jepa_loss': avg_jepa_loss,
+        'jepa_mse': avg_mse,
+        'jepa_variance': avg_var,
+        'jepa_covariance': avg_cov,
+        'global_step': current_step
+    }
+
+
+def train_epoch_phase2(
+    trainer: StateVLATrainer,
+    dataloader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: str,
+    epoch: int,
+    config: dict,
+    global_step: int = 0,
+    total_steps: int = 0
+):
+    """Train Phase 2: Flow Matching."""
+    trainer.train()
+    total_loss = 0
+    total_pos_rot_loss = 0
+    total_gripper_loss = 0
+    num_batches = 0
+    current_step = global_step
+
+    pbar = tqdm(dataloader, desc=f"[Phase 2] Epoch {epoch}")
+
+    for batch in pbar:
+        # Move data to device
+        obs = {k: v.to(device) for k, v in batch['obs'].items()}
+        actions = batch['actions'].to(device)
+
+        # Forward pass
+        optimizer.zero_grad()
+        outputs = trainer(
+            obs_dict=obs,
+            gt_actions=actions,
+        )
+
+        loss = outputs['loss']
+
+        # Backward pass
+        loss.backward()
+
+        # Gradient clipping
+        if config['training'].get('gradient_clip', 0) > 0:
+            torch.nn.utils.clip_grad_norm_(
+                trainer.parameters(),
+                config['training']['gradient_clip']
+            )
+
+        optimizer.step()
+        current_step += 1
+
+        # Logging
+        total_loss += loss.item()
+        total_pos_rot_loss += outputs['pos_rot_loss'].item()
+        total_gripper_loss += outputs['gripper_loss'].item()
+        num_batches += 1
+
+        pbar.set_postfix({
+            'loss': f"{loss.item():.4f}",
+            'pos_rot': f"{outputs['pos_rot_loss'].item():.4f}",
+            'gripper': f"{outputs['gripper_loss'].item():.4f}",
+        })
+
+    avg_loss = total_loss / max(num_batches, 1)
+    avg_pos_rot = total_pos_rot_loss / max(num_batches, 1)
+    avg_gripper = total_gripper_loss / max(num_batches, 1)
+
+    return {
+        'loss': avg_loss,
+        'pos_rot_loss': avg_pos_rot,
+        'gripper_loss': avg_gripper,
         'global_step': current_step
     }
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train StateVLA with JEPA')
+    parser = argparse.ArgumentParser(description='Train StateVLA (Two-Phase)')
     parser.add_argument('--config', type=str, default='conf/config.yaml',
                         help='Path to config file')
+    parser.add_argument('--phase', type=int, default=1, choices=[1, 2],
+                        help='Training phase (1=JEPA, 2=Flow Matching)')
+    parser.add_argument('--phase1_checkpoint', type=str, default=None,
+                        help='Phase 1 checkpoint for Phase 2 training')
     parser.add_argument('--data_directory', type=str, default=None,
                         help='Override data directory')
     parser.add_argument('--checkpoint', type=str, default=None,
-                        help='Resume from checkpoint')
+                        help='Resume from checkpoint (same phase)')
     parser.add_argument('--device', type=str, default=None,
                         help='Override device')
     parser.add_argument('--batch_size', type=int, default=None,
@@ -195,8 +287,12 @@ def main():
     # Set seed
     set_seed(config.get('seed', 42))
 
+    phase = args.phase
+    log.info(f"=== Phase {phase} Training ===")
     log.info(f"Using device: {device}")
-    log.info(f"Config: {config}")
+
+    # Get phase-specific config
+    phase_config = config['training'].get(f'phase{phase}', {})
 
     # Create dataset and dataloader
     log.info("Loading dataset...")
@@ -214,7 +310,7 @@ def main():
     log.info(f"Dataset size: {len(dataset)}")
 
     # Create model
-    log.info("Creating StateVLA model with JEPA...")
+    log.info(f"Creating StateVLA model (Phase {phase})...")
     model_config = config['model']
 
     model = StateVLA(
@@ -237,10 +333,9 @@ def main():
         d_state=model_config.get('d_state', 16),
         d_conv=model_config.get('d_conv', 4),
         expand=model_config.get('expand', 2),
-        # Predictor config
+        # Legacy predictor config
         predictor_embed_dim=model_config.get('predictor_embed_dim', 192),
         predictor_depth=model_config.get('predictor_depth', 6),
-        # Masking config
         mask_ratio=model_config.get('mask_ratio', 0.5),
         masking_strategy=model_config.get('masking_strategy', 'modality_aware'),
         # State config
@@ -251,6 +346,10 @@ def main():
         # Policy config
         policy_layers=model_config.get('policy_layers', 3),
         policy_embed_dim=model_config.get('policy_embed_dim', 256),
+        # Temporal predictor config
+        temporal_hidden_dim=phase_config.get('temporal_predictor_hidden_dim', 512),
+        # Training phase
+        training_phase=phase,
         # Device
         device=device,
     )
@@ -275,8 +374,22 @@ def main():
         action_stats['mean'].to(device),
         action_stats['std'].to(device)
     )
-    log.info(f"Action normalization - mean: {action_stats['mean'].numpy()}")
-    log.info(f"Action normalization - std: {action_stats['std'].numpy()}")
+
+    # Phase 2: Load Phase 1 checkpoint and freeze encoder
+    if phase == 2:
+        phase1_ckpt_path = args.phase1_checkpoint or phase_config.get('phase1_checkpoint')
+        if phase1_ckpt_path is None:
+            log.error("Phase 2 requires --phase1_checkpoint or phase2.phase1_checkpoint in config")
+            return
+
+        log.info(f"Loading Phase 1 checkpoint: {phase1_ckpt_path}")
+        phase1_ckpt = torch.load(phase1_ckpt_path, map_location=device)
+        trainer.load_state_dict(phase1_ckpt['model_state_dict'], strict=False)
+        log.info("Phase 1 encoder weights loaded successfully")
+
+        # Freeze encoder
+        trainer.model.freeze_encoder()
+        log.info("Encoder frozen for Phase 2 training")
 
     # Count parameters
     total_params = sum(p.numel() for p in trainer.parameters())
@@ -284,28 +397,30 @@ def main():
     log.info(f"Total parameters: {total_params / 1e6:.2f}M")
     log.info(f"Trainable parameters: {trainable_params / 1e6:.2f}M")
 
-    # Create optimizer
+    # Create optimizer (only for trainable parameters)
+    lr = phase_config.get('learning_rate', training_config['learning_rate'])
     optimizer = torch.optim.AdamW(
-        trainer.parameters(),
-        lr=training_config['learning_rate'],
+        filter(lambda p: p.requires_grad, trainer.parameters()),
+        lr=lr,
         weight_decay=training_config['weight_decay']
     )
 
     # Learning rate scheduler
+    num_epochs = phase_config.get('num_epochs', training_config['num_epochs'])
     scheduler = None
     if training_config.get('use_lr_scheduler', False):
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=training_config['num_epochs'],
+            T_max=num_epochs,
             eta_min=training_config.get('min_lr', 1e-6)
         )
 
-    # Resume from checkpoint
+    # Resume from checkpoint (same phase)
     start_epoch = 0
     best_loss = float('inf')
 
     if args.checkpoint:
-        log.info(f"Loading checkpoint from {args.checkpoint}")
+        log.info(f"Resuming from checkpoint: {args.checkpoint}")
         checkpoint = torch.load(args.checkpoint, map_location=device)
         trainer.load_state_dict(checkpoint['model_state_dict'], strict=False)
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -313,25 +428,29 @@ def main():
         best_loss = checkpoint.get('loss', float('inf'))
         log.info(f"Resumed from epoch {start_epoch}")
 
+        # Re-freeze encoder if Phase 2
+        if phase == 2:
+            trainer.model.freeze_encoder()
+
     # Setup checkpoint directory
     checkpoint_dir = training_config.get('checkpoint_dir', 'checkpoints')
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    checkpoint_dir = os.path.join(checkpoint_dir, f'jepa_{timestamp}')
+    checkpoint_dir = os.path.join(checkpoint_dir, f'phase{phase}_{timestamp}')
 
     # Training loop
-    log.info("Starting JEPA training...")
-    num_epochs = training_config['num_epochs']
-
-    # Calculate total steps for EMA momentum schedule
+    log.info(f"Starting Phase {phase} training...")
     steps_per_epoch = len(dataloader)
     total_steps = num_epochs * steps_per_epoch
     global_step = start_epoch * steps_per_epoch
 
-    log.info(f"Total training steps: {total_steps}")
+    log.info(f"Epochs: {num_epochs}, Steps/epoch: {steps_per_epoch}, Total steps: {total_steps}")
+
+    # Select phase-specific training function
+    train_fn = train_epoch_phase1 if phase == 1 else train_epoch_phase2
 
     for epoch in range(start_epoch, num_epochs):
         # Train
-        train_metrics = train_epoch(
+        train_metrics = train_fn(
             trainer=trainer,
             dataloader=dataloader,
             optimizer=optimizer,
@@ -349,11 +468,20 @@ def main():
         if scheduler is not None:
             scheduler.step()
 
-        log.info(
-            f"Epoch {epoch}: loss={train_metrics['loss']:.4f}, "
-            f"action_loss={train_metrics['action_loss']:.4f}, "
-            f"jepa_loss={train_metrics['jepa_loss']:.4f}"
-        )
+        # Log metrics
+        if phase == 1:
+            log.info(
+                f"Epoch {epoch}: loss={train_metrics['loss']:.4f}, "
+                f"mse={train_metrics['jepa_mse']:.4f}, "
+                f"var={train_metrics['jepa_variance']:.4f}, "
+                f"cov={train_metrics['jepa_covariance']:.4f}"
+            )
+        else:
+            log.info(
+                f"Epoch {epoch}: loss={train_metrics['loss']:.4f}, "
+                f"pos_rot={train_metrics['pos_rot_loss']:.4f}, "
+                f"gripper={train_metrics['gripper_loss']:.4f}"
+            )
 
         # Save checkpoint
         is_best = train_metrics['loss'] < best_loss
@@ -371,7 +499,16 @@ def main():
                 is_best=is_best
             )
 
-    log.info("Training complete!")
+    log.info(f"Phase {phase} training complete!")
+    log.info(f"Best loss: {best_loss:.4f}")
+    log.info(f"Checkpoints saved to: {checkpoint_dir}")
+
+    if phase == 1:
+        log.info(
+            f"\nNext step: Run Phase 2 with:\n"
+            f"  python train.py --config {args.config} --phase 2 "
+            f"--phase1_checkpoint {checkpoint_dir}/checkpoint_best.pt"
+        )
 
 
 if __name__ == '__main__':

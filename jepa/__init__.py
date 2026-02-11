@@ -7,6 +7,7 @@ from .tokenizer import (
 from .masking import ModalityAwareMasking, RandomTokenMasking
 from .encoder import ContextEncoder, TargetEncoder
 from .predictor import JEPAPredictor
+from .temporal_predictor import TemporalPredictor, compute_temporal_jepa_loss
 
 __all__ = [
     'ImageTokenizer',
@@ -18,4 +19,6 @@ __all__ = [
     'ContextEncoder',
     'TargetEncoder',
     'JEPAPredictor',
+    'TemporalPredictor',
+    'compute_temporal_jepa_loss',
 ]

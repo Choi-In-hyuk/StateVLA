@@ -81,26 +81,21 @@ class ContextEncoder(nn.Module):
         Forward pass through context encoder.
 
         Args:
-            tokens: [B, N, D] all tokens (including CLS at position 0)
+            tokens: [B, N, D] all tokens (CLS at last position for Mamba causal)
             mask: [B, N] True = masked tokens to exclude from processing
                   If None, process all tokens (inference mode)
 
         Returns:
-            features: [B, N_visible, D] features for visible tokens
+            features: [B, N_visible-1, D] features for visible tokens (excl CLS)
             cls_output: [B, D] CLS token output (z_t)
         """
         B, N, D = tokens.shape
 
         if mask is not None:
             # Extract only visible tokens
-            # CLS token (position 0) is always visible (mask[b,0] should be False)
+            # CLS token (last position) is always visible
             visible_mask = ~mask  # True = visible
 
-            # Get visible tokens for each sample
-            # Since batch samples may have different numbers of visible tokens,
-            # we need to handle this carefully
-
-            # For simplicity, we'll pad to max visible length
             max_visible = visible_mask.sum(dim=1).max().item()
 
             visible_tokens_list = []
@@ -131,11 +126,11 @@ class ContextEncoder(nn.Module):
         # Apply final norm
         hidden = self.norm(hidden)
 
-        # CLS output is always the first token
-        cls_output = hidden[:, 0]  # [B, D]
+        # CLS output is the LAST token (Mamba causal: last sees all previous)
+        cls_output = hidden[:, -1]  # [B, D]
 
-        # Features are all tokens except CLS
-        features = hidden[:, 1:]  # [B, max_visible-1, D]
+        # Features are all tokens except CLS (last)
+        features = hidden[:, :-1]  # [B, max_visible-1, D]
 
         return features, cls_output
 

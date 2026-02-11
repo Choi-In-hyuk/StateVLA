@@ -1,8 +1,8 @@
 """
-StateVLA JEPA Evaluation Script
+StateVLA Evaluation Script (Two-Phase)
 
 Usage:
-    python eval.py --checkpoint checkpoints/libero_object/jepa_xxx/checkpoint_best.pt
+    python eval.py --checkpoint checkpoints/phase2_xxx/checkpoint_best.pt
     python eval.py --checkpoint checkpoints/checkpoint_best.pt --config conf/config.yaml
 """
 
@@ -105,7 +105,7 @@ def evaluate(
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Evaluate StateVLA JEPA')
+    parser = argparse.ArgumentParser(description='Evaluate StateVLA')
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to model checkpoint')
     parser.add_argument('--config', type=str, default=None,
@@ -183,6 +183,10 @@ def main():
         # Policy config
         policy_layers=model_config.get('policy_layers', 3),
         policy_embed_dim=model_config.get('policy_embed_dim', 256),
+        # Temporal predictor config
+        temporal_hidden_dim=config['training'].get('phase1', {}).get('temporal_predictor_hidden_dim', 512),
+        # Phase 2 for inference
+        training_phase=2,
         # Device
         device=device,
     )

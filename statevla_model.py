@@ -1,17 +1,16 @@
 """
-StateVLA: State-based Vision-Language-Action Model with JEPA
+StateVLA: State-based Vision-Language-Action Model with Two-Phase Training
 
-JEPA-based architecture:
-  - Multimodal Tokenization (ViT patches + language + robot state)
-  - Mamba-based Context Encoder with masking
-  - Target Encoder (EMA) for self-supervised learning
-  - JEPA Predictor for masked token prediction
-  - Flow Matching Action Policy
+Phase 1 - Temporal JEPA (표현 학습):
+  obs_t → Encoder → z_t
+  z_t + a_t → TemporalPredictor → z'_{t+1}
+  obs_{t+1} → TargetEncoder (EMA) → z_{t+1}
+  Loss: MSE(z'_{t+1}, z_{t+1}) + VICReg
 
-Key features:
-  - Learns rich state representations via masked prediction
-  - No explicit world model (z_t → z_{t+1}) - focuses on current state quality
-  - VICReg regularization prevents representation collapse
+Phase 2 - Flow Matching (정책 학습):
+  obs_t → FrozenEncoder → z_t
+  z_t → FlowMatchingPolicy → a_t
+  Loss: FlowMatching(velocity) + BCE(gripper)
 """
 
 import torch
@@ -19,21 +18,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Optional, List
 
-from state_encoder import JEPAStateEncoder, compute_jepa_loss
+from state_encoder import JEPAStateEncoder
+from jepa.temporal_predictor import compute_temporal_jepa_loss
 from action_policy import ActionPolicy
 
 
 class StateVLA(nn.Module):
     """
-    JEPA-based StateVLA Model.
+    Two-Phase StateVLA Model.
 
-    Architecture:
-        obs_dict → JEPAStateEncoder → z_t
-        z_t → ActionPolicy (Flow Matching) → action
-
-    Training:
-        - JEPA loss: MSE(predicted_masked, target_masked) + VICReg
-        - Action loss: Flow Matching loss
+    Phase 1: Trains encoder + temporal predictor (learns physics/causality)
+    Phase 2: Freezes encoder, trains action policy (learns smooth actions)
     """
 
     def __init__(
@@ -57,10 +52,10 @@ class StateVLA(nn.Module):
         d_state: int = 16,
         d_conv: int = 4,
         expand: int = 2,
-        # Predictor config
+        # Predictor config (legacy, kept for compatibility)
         predictor_embed_dim: int = 192,
         predictor_depth: int = 6,
-        # Masking config
+        # Masking config (legacy, kept for compatibility)
         mask_ratio: float = 0.5,
         masking_strategy: str = 'modality_aware',
         # State config
@@ -71,6 +66,10 @@ class StateVLA(nn.Module):
         # Policy config
         policy_layers: int = 3,
         policy_embed_dim: int = 256,
+        # Temporal predictor config
+        temporal_hidden_dim: int = 512,
+        # Training phase
+        training_phase: int = 1,
         # Device
         device: str = 'cuda',
     ):
@@ -79,9 +78,10 @@ class StateVLA(nn.Module):
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.action_seq_len = action_seq_len
+        self.training_phase = training_phase
         self.device = device
 
-        # JEPA State Encoder
+        # JEPA State Encoder (used in both phases)
         self.state_encoder = JEPAStateEncoder(
             camera_names=camera_names,
             image_size=image_size,
@@ -89,18 +89,18 @@ class StateVLA(nn.Module):
             embed_dim=embed_dim,
             lang_emb_dim=lang_emb_dim,
             robot_state_dim=robot_state_dim,
-            # Pretrained encoder options
             use_pretrained_vision=use_pretrained_vision,
             use_pretrained_language=use_pretrained_language,
             vision_model_name=vision_model_name,
             language_model_name=language_model_name,
             freeze_vision=freeze_vision,
             freeze_language=freeze_language,
-            # Encoder config
             encoder_depth=encoder_depth,
             d_state=d_state,
             d_conv=d_conv,
             expand=expand,
+            action_dim=action_dim,
+            temporal_hidden_dim=temporal_hidden_dim,
             predictor_embed_dim=predictor_embed_dim,
             predictor_depth=predictor_depth,
             mask_ratio=mask_ratio,
@@ -109,8 +109,7 @@ class StateVLA(nn.Module):
             device=device,
         )
 
-        # Action Policy (Flow Matching)
-        # Simplified: only uses z_t, no z_next_pred or error
+        # Action Policy (only needed for Phase 2 and inference)
         self.action_policy = ActionPolicy(
             state_dim=state_dim,
             action_dim=action_dim,
@@ -118,7 +117,7 @@ class StateVLA(nn.Module):
             embed_dim=policy_embed_dim,
             n_layer=policy_layers,
             d_intermediate=policy_embed_dim,
-            use_correction=False,  # No correction in JEPA mode
+            use_correction=False,
             device=device,
         )
 
@@ -137,75 +136,112 @@ class StateVLA(nn.Module):
         denormalized[..., :6] = actions[..., :6] * self.action_std + self.action_mean
         return denormalized
 
+    def freeze_encoder(self):
+        """Freeze state encoder for Phase 2 training."""
+        for param in self.state_encoder.parameters():
+            param.requires_grad = False
+        self.training_phase = 2
+
+    def unfreeze_encoder(self):
+        """Unfreeze state encoder (e.g., for fine-tuning)."""
+        for param in self.state_encoder.parameters():
+            param.requires_grad = True
+
+    def forward_phase1(
+        self,
+        obs_dict: Dict[str, torch.Tensor],
+        next_obs_dict: Dict[str, torch.Tensor],
+        action: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Phase 1 forward pass: Temporal JEPA.
+
+        Args:
+            obs_dict: Current observation
+            next_obs_dict: Next observation
+            action: [B, action_dim] action at time t
+
+        Returns:
+            Dictionary with z_t, z_next_pred, z_next_target
+        """
+        return self.state_encoder.forward_temporal(obs_dict, next_obs_dict, action)
+
+    def forward_phase2(
+        self,
+        obs_dict: Dict[str, torch.Tensor],
+        gt_actions: torch.Tensor,
+        sigma: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Phase 2 forward pass: Flow Matching policy.
+
+        Args:
+            obs_dict: Current observation
+            gt_actions: [B, action_seq_len, action_dim] ground truth actions
+            sigma: [B] diffusion timestep
+
+        Returns:
+            Dictionary with z_t, velocity, noise, gripper_logits, gripper_targets
+        """
+        batch_size = gt_actions.shape[0]
+
+        # Encode state (frozen encoder)
+        with torch.no_grad():
+            state_outputs = self.state_encoder(obs_dict)
+        z_t = state_outputs['z_t']
+
+        outputs = {'z_t': z_t}
+
+        # Split actions: pos/rot (6 dims) and gripper (1 dim)
+        pos_rot_actions = gt_actions[:, :, :6]
+        gripper_actions = gt_actions[:, :, 6]
+
+        # Sample noise for flow matching (pos/rot only)
+        noise = torch.randn_like(pos_rot_actions)
+        sigma_expanded = sigma.view(batch_size, 1, 1)
+        noisy_pos_rot = (1 - sigma_expanded) * pos_rot_actions + sigma_expanded * noise
+
+        # Create full noisy actions with dummy gripper
+        dummy_gripper = torch.zeros(batch_size, gt_actions.shape[1], 1, device=z_t.device)
+        noisy_actions = torch.cat([noisy_pos_rot, dummy_gripper], dim=-1)
+
+        # Predict velocity and gripper logits
+        z_next_dummy = torch.zeros_like(z_t)
+        error_dummy = torch.zeros_like(z_t)
+
+        velocity, gripper_logits = self.action_policy(
+            z_t, z_next_dummy, error_dummy, noisy_actions, sigma
+        )
+
+        outputs['velocity'] = velocity
+        outputs['noise'] = noise
+        outputs['gripper_logits'] = gripper_logits
+        outputs['gripper_targets'] = gripper_actions
+
+        return outputs
+
     def forward(
         self,
         obs_dict: Dict[str, torch.Tensor],
         gt_actions: Optional[torch.Tensor] = None,
         sigma: Optional[torch.Tensor] = None,
+        next_obs_dict: Optional[Dict[str, torch.Tensor]] = None,
+        action: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Forward pass for training.
+        Unified forward pass that routes to phase-specific methods.
 
-        Args:
-            obs_dict: Dictionary containing:
-                - 'agentview_image': [B, C, H, W]
-                - 'eye_in_hand_image': [B, C, H, W]
-                - 'lang_emb': [B, lang_emb_dim]
-                - 'robot_states': [B, robot_state_dim]
-            gt_actions: [B, action_seq_len, action_dim] ground truth actions
-            sigma: [B] diffusion timestep
-
-        Returns:
-            Dictionary containing:
-                - 'z_t': [B, state_dim] state representation
-                - 'predictions': [B, N_masked, D] JEPA predictions
-                - 'targets': [B, N_masked, D] JEPA targets
-                - 'mask': [B, N] mask used
-                - 'velocity': [B, action_seq_len, action_dim] (if training)
-                - 'noise': [B, action_seq_len, action_dim] (if training)
+        Phase 1: requires next_obs_dict, action
+        Phase 2: requires gt_actions, sigma
         """
-        batch_size = obs_dict['lang_emb'].shape[0]
-
-        # 1. JEPA State Encoding
-        state_outputs = self.state_encoder(obs_dict, return_loss=True)
-        z_t = state_outputs['z_t']
-
-        outputs = {
-            'z_t': z_t,
-            'predictions': state_outputs.get('predictions'),
-            'targets': state_outputs.get('targets'),
-            'mask': state_outputs.get('mask'),
-        }
-
-        # 2. Action Policy (if training)
-        if gt_actions is not None and sigma is not None:
-            # Split actions: pos/rot (6 dims) and gripper (1 dim)
-            pos_rot_actions = gt_actions[:, :, :6]
-            gripper_actions = gt_actions[:, :, 6]  # [B, seq_len]
-
-            # Sample noise for flow matching (pos/rot only)
-            noise = torch.randn_like(pos_rot_actions)
-            sigma_expanded = sigma.view(batch_size, 1, 1)
-            noisy_pos_rot = (1 - sigma_expanded) * pos_rot_actions + sigma_expanded * noise
-
-            # Create full noisy actions with dummy gripper
-            dummy_gripper = torch.zeros(batch_size, gt_actions.shape[1], 1, device=z_t.device)
-            noisy_actions = torch.cat([noisy_pos_rot, dummy_gripper], dim=-1)
-
-            # Predict velocity and gripper logits
-            z_next_dummy = torch.zeros_like(z_t)
-            error_dummy = torch.zeros_like(z_t)
-
-            velocity, gripper_logits = self.action_policy(
-                z_t, z_next_dummy, error_dummy, noisy_actions, sigma
-            )
-
-            outputs['velocity'] = velocity  # [B, seq_len, 6] pos/rot velocity
-            outputs['noise'] = noise        # [B, seq_len, 6] pos/rot noise
-            outputs['gripper_logits'] = gripper_logits  # [B, seq_len]
-            outputs['gripper_targets'] = gripper_actions  # [B, seq_len]
-
-        return outputs
+        if self.training_phase == 1 and next_obs_dict is not None and action is not None:
+            return self.forward_phase1(obs_dict, next_obs_dict, action)
+        elif gt_actions is not None and sigma is not None:
+            return self.forward_phase2(obs_dict, gt_actions, sigma)
+        else:
+            # Inference / encode only
+            state_outputs = self.state_encoder(obs_dict)
+            return {'z_t': state_outputs['z_t']}
 
     @torch.no_grad()
     def predict(
@@ -225,10 +261,10 @@ class StateVLA(nn.Module):
         """
         self.eval()
 
-        # Encode state (no masking in inference)
+        # Encode state
         z_t = self.state_encoder.encode(obs_dict)
 
-        # Generate actions (normalized)
+        # Generate actions
         z_next_dummy = torch.zeros_like(z_t)
         error_dummy = torch.zeros_like(z_t)
 
@@ -236,7 +272,7 @@ class StateVLA(nn.Module):
             z_t, z_next_dummy, error_dummy, sample_steps
         )
 
-        # Denormalize pos/rot actions (gripper is already binary)
+        # Denormalize pos/rot actions
         actions = self.denormalize_actions(actions)
 
         return actions
@@ -269,12 +305,10 @@ class StateVLA(nn.Module):
 
 class StateVLATrainer(nn.Module):
     """
-    Training wrapper for StateVLA with JEPA losses.
+    Two-Phase Training wrapper for StateVLA.
 
-    Handles:
-    - JEPA loss computation (MSE + VICReg)
-    - Action loss computation (Flow Matching)
-    - EMA target encoder updates
+    Phase 1: Temporal JEPA loss (MSE + VICReg)
+    Phase 2: Action loss (Flow Matching + Gripper BCE)
     """
 
     def __init__(
@@ -308,16 +342,14 @@ class StateVLATrainer(nn.Module):
         Compute Flow Matching loss for pos/rot and BCE loss for gripper.
 
         Args:
-            velocity_pred: [B, seq_len, 6] predicted velocity for pos/rot
-            noise: [B, seq_len, 6] sampled noise for pos/rot
-            pos_rot_actions: [B, seq_len, 6] ground truth pos/rot actions
+            velocity_pred: [B, seq_len, 6] predicted velocity
+            noise: [B, seq_len, 6] sampled noise
+            pos_rot_actions: [B, seq_len, 6] ground truth pos/rot
             gripper_logits: [B, seq_len] gripper prediction logits
-            gripper_targets: [B, seq_len] ground truth gripper actions (-1 or 1)
+            gripper_targets: [B, seq_len] ground truth gripper (-1 or 1)
 
         Returns:
-            total_loss: combined loss
-            pos_rot_loss: position/rotation loss
-            gripper_loss: gripper BCE loss
+            total_loss, pos_rot_loss, gripper_loss
         """
         # Position/Rotation Flow Matching loss
         target_velocity = noise - pos_rot_actions
@@ -328,27 +360,67 @@ class StateVLATrainer(nn.Module):
         gripper_loss = F.binary_cross_entropy_with_logits(gripper_logits, gripper_binary)
 
         total_loss = pos_rot_loss + gripper_loss
-
         return total_loss, pos_rot_loss, gripper_loss
 
-    def forward(
+    def forward_phase1(
         self,
         obs_dict: Dict[str, torch.Tensor],
-        gt_actions: torch.Tensor,
+        next_obs_dict: Dict[str, torch.Tensor],
+        action: torch.Tensor,
         step: Optional[int] = None,
         total_steps: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Training forward pass.
+        Phase 1 training: Temporal JEPA loss.
 
         Args:
-            obs_dict: Observation dictionary
-            gt_actions: [B, action_seq_len, action_dim] ground truth actions
-            step: Current training step (for EMA schedule)
+            obs_dict: Current observation
+            next_obs_dict: Next observation
+            action: [B, action_dim] action at time t
+            step: Current training step
             total_steps: Total training steps
 
         Returns:
-            Dictionary with losses and outputs
+            Dictionary with losses
+        """
+        outputs = self.model.forward_phase1(obs_dict, next_obs_dict, action)
+
+        # Temporal JEPA loss
+        jepa_losses = compute_temporal_jepa_loss(
+            outputs['z_next_pred'],
+            outputs['z_next_target'],
+            variance_weight=self.variance_weight,
+            covariance_weight=self.covariance_weight,
+        )
+
+        total_loss = self.jepa_loss_weight * jepa_losses['total']
+
+        return {
+            'loss': total_loss,
+            'jepa_loss': jepa_losses['total'],
+            'jepa_mse': jepa_losses['mse'],
+            'jepa_variance': jepa_losses['variance'],
+            'jepa_covariance': jepa_losses['covariance'],
+            'action_loss': torch.tensor(0.0, device=total_loss.device),
+            'pos_rot_loss': torch.tensor(0.0, device=total_loss.device),
+            'gripper_loss': torch.tensor(0.0, device=total_loss.device),
+            'z_t': outputs['z_t'],
+        }
+
+    def forward_phase2(
+        self,
+        obs_dict: Dict[str, torch.Tensor],
+        gt_actions: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Phase 2 training: Flow Matching action loss.
+
+        Args:
+            obs_dict: Current observation
+            gt_actions: [B, action_seq_len, action_dim] ground truth actions
+
+        Returns:
+            Dictionary with losses
         """
         batch_size = gt_actions.shape[0]
         device = gt_actions.device
@@ -356,59 +428,54 @@ class StateVLATrainer(nn.Module):
         # Sample sigma for flow matching
         sigma = torch.rand(batch_size, device=device)
 
-        # Forward pass
-        outputs = self.model(obs_dict, gt_actions, sigma)
-
-        # JEPA loss
-        if outputs['predictions'] is not None and outputs['targets'] is not None:
-            jepa_losses = compute_jepa_loss(
-                outputs['predictions'],
-                outputs['targets'],
-                outputs['mask'],
-                variance_weight=self.variance_weight,
-                covariance_weight=self.covariance_weight,
-            )
-            jepa_loss = jepa_losses['total']
-        else:
-            jepa_loss = torch.tensor(0.0, device=device)
-            jepa_losses = {'mse': jepa_loss, 'variance': jepa_loss, 'covariance': jepa_loss}
+        outputs = self.model.forward_phase2(obs_dict, gt_actions, sigma)
 
         # Action loss
-        if outputs['velocity'] is not None:
-            action_loss, pos_rot_loss, gripper_loss = self.compute_action_loss(
-                outputs['velocity'],
-                outputs['noise'],
-                gt_actions[:, :, :6],  # pos/rot only
-                outputs['gripper_logits'],
-                outputs['gripper_targets'],
-            )
-        else:
-            action_loss = torch.tensor(0.0, device=device)
-            pos_rot_loss = torch.tensor(0.0, device=device)
-            gripper_loss = torch.tensor(0.0, device=device)
-
-        # Total loss
-        total_loss = (
-            self.jepa_loss_weight * jepa_loss +
-            self.action_loss_weight * action_loss
+        action_loss, pos_rot_loss, gripper_loss = self.compute_action_loss(
+            outputs['velocity'],
+            outputs['noise'],
+            gt_actions[:, :, :6],
+            outputs['gripper_logits'],
+            outputs['gripper_targets'],
         )
+
+        total_loss = self.action_loss_weight * action_loss
 
         return {
             'loss': total_loss,
-            'jepa_loss': jepa_loss,
-            'jepa_mse': jepa_losses['mse'],
-            'jepa_variance': jepa_losses['variance'],
-            'jepa_covariance': jepa_losses['covariance'],
+            'jepa_loss': torch.tensor(0.0, device=device),
+            'jepa_mse': torch.tensor(0.0, device=device),
+            'jepa_variance': torch.tensor(0.0, device=device),
+            'jepa_covariance': torch.tensor(0.0, device=device),
             'action_loss': action_loss,
             'pos_rot_loss': pos_rot_loss,
             'gripper_loss': gripper_loss,
             'z_t': outputs['z_t'],
         }
 
+    def forward(
+        self,
+        obs_dict: Dict[str, torch.Tensor],
+        gt_actions: Optional[torch.Tensor] = None,
+        step: Optional[int] = None,
+        total_steps: Optional[int] = None,
+        # Phase 1 specific
+        next_obs_dict: Optional[Dict[str, torch.Tensor]] = None,
+        action: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Unified training forward pass.
+
+        Phase 1: requires next_obs_dict, action
+        Phase 2: requires gt_actions
+        """
+        if self.model.training_phase == 1:
+            return self.forward_phase1(obs_dict, next_obs_dict, action, step, total_steps)
+        else:
+            return self.forward_phase2(obs_dict, gt_actions)
+
     def update_target_encoder(self, step: int, total_steps: int):
-        """
-        Update target encoder with scheduled momentum.
-        """
+        """Update target encoder with scheduled momentum."""
         if self.ema_momentum_schedule == 'cosine':
             import math
             progress = step / total_steps

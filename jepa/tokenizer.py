@@ -526,12 +526,34 @@ class MultiModalTokenizer(nn.Module):
         all_tokens = []
         all_modality_ids = []
 
-        # CLS token
-        cls_tokens = self.cls_token.expand(B, -1, -1)
-        all_tokens.append(cls_tokens)
-        all_modality_ids.append(torch.full((B, 1), -1, device=device, dtype=torch.long))
+        # Token order: [Lang] → [Robot] → [Vision] → [CLS]
+        # Mamba is causal (left-to-right), so language must come FIRST
+        # so that vision patches are processed with language context already
+        # in the hidden state ("어떤 물체를 찾아야 하는지" 알고 이미지를 봄)
 
-        # Image tokens
+        # 1. Language token (FIRST - conditions all subsequent processing)
+        lang_emb = obs_dict['lang_emb']
+        lang_tokens = self.language_tokenizer(lang_emb)
+        lang_tokens = lang_tokens + self.modality_embed(
+            torch.tensor(self.MODALITY_LANGUAGE, device=device)
+        )
+        all_tokens.append(lang_tokens)
+        all_modality_ids.append(
+            torch.full((B, self.num_lang_tokens), self.MODALITY_LANGUAGE, device=device, dtype=torch.long)
+        )
+
+        # 2. Robot state token (provides proprioception context for vision)
+        robot_state = obs_dict['robot_states']
+        robot_tokens = self.robot_state_tokenizer(robot_state)
+        robot_tokens = robot_tokens + self.modality_embed(
+            torch.tensor(self.MODALITY_ROBOT_STATE, device=device)
+        )
+        all_tokens.append(robot_tokens)
+        all_modality_ids.append(
+            torch.full((B, self.num_robot_tokens), self.MODALITY_ROBOT_STATE, device=device, dtype=torch.long)
+        )
+
+        # 3. Image tokens (processed with lang + robot context in hidden state)
         for i, name in enumerate(self.camera_names):
             if name == 'agentview':
                 img_key = 'agentview_image'
@@ -560,27 +582,10 @@ class MultiModalTokenizer(nn.Module):
                 torch.full((B, self.num_patches_per_image), modality_id, device=device, dtype=torch.long)
             )
 
-        # Language token
-        lang_emb = obs_dict['lang_emb']
-        lang_tokens = self.language_tokenizer(lang_emb)
-        lang_tokens = lang_tokens + self.modality_embed(
-            torch.tensor(self.MODALITY_LANGUAGE, device=device)
-        )
-        all_tokens.append(lang_tokens)
-        all_modality_ids.append(
-            torch.full((B, self.num_lang_tokens), self.MODALITY_LANGUAGE, device=device, dtype=torch.long)
-        )
-
-        # Robot state token
-        robot_state = obs_dict['robot_states']
-        robot_tokens = self.robot_state_tokenizer(robot_state)
-        robot_tokens = robot_tokens + self.modality_embed(
-            torch.tensor(self.MODALITY_ROBOT_STATE, device=device)
-        )
-        all_tokens.append(robot_tokens)
-        all_modality_ids.append(
-            torch.full((B, self.num_robot_tokens), self.MODALITY_ROBOT_STATE, device=device, dtype=torch.long)
-        )
+        # 4. CLS token at the END (sees everything: lang + robot + all vision)
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        all_tokens.append(cls_tokens)
+        all_modality_ids.append(torch.full((B, 1), -1, device=device, dtype=torch.long))
 
         tokens = torch.cat(all_tokens, dim=1)
         modality_ids = torch.cat(all_modality_ids, dim=1)
@@ -588,17 +593,23 @@ class MultiModalTokenizer(nn.Module):
         return tokens, modality_ids
 
     def get_modality_ranges(self) -> Dict[str, Tuple[int, int]]:
-        """Get token index ranges for each modality."""
-        ranges = {}
-        idx = 1  # Skip CLS
+        """Get token index ranges for each modality.
 
-        for name in self.camera_names:
-            ranges[name] = (idx, idx + self.num_patches_per_image)
-            idx += self.num_patches_per_image
+        Order: [Lang] → [Robot] → [Vision cameras...] → [CLS]
+        """
+        ranges = {}
+        idx = 0
 
         ranges['language'] = (idx, idx + self.num_lang_tokens)
         idx += self.num_lang_tokens
 
         ranges['robot_state'] = (idx, idx + self.num_robot_tokens)
+        idx += self.num_robot_tokens
+
+        for name in self.camera_names:
+            ranges[name] = (idx, idx + self.num_patches_per_image)
+            idx += self.num_patches_per_image
+
+        ranges['cls'] = (idx, idx + 1)
 
         return ranges
