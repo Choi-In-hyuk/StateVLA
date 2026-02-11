@@ -1,176 +1,254 @@
 # StateVLA: State-based Vision-Language-Action Model
 
-StateVLA is a Vision-Language-Action model that learns **physics-aware state representations** via Temporal JEPA, then generates smooth robot actions via Flow Matching.
+**Physics-aware Representation Learning via Temporal JEPA and Smooth Action Generation via Flow Matching**
 
-The two-phase design ensures the encoder learns "what happens when I do this action" before training the policy. We leverage **Pretrained Vision (SigLIP)** and **Language (CLIP)** backbones with a lightweight **Mamba SSM** to achieve both high performance and fast inference.
+---
 
-## Key Innovation
+## Abstract
 
-**Traditional VLA**: `obs → action` (no world model, heavy computation)
+StateVLA is a lightweight yet high-performance Vision-Language-Action (VLA) model designed for real-time robotic control. Unlike traditional end-to-end VLA architectures that directly map observations to actions, StateVLA separates **world representation learning** and **policy learning**, enabling more stable training, smoother actions, and significantly faster inference.
 
-**StateVLA**: Learn world dynamics first with efficient state-space models.
+The model first learns **physics-aware latent state representations** using Temporal Joint Embedding Predictive Architecture (Temporal JEPA), and then generates continuous robot trajectories using **Flow Matching** conditioned on the learned latent state. By leveraging pretrained SigLIP vision encoders, CLIP language embeddings, and an efficient **Mamba State Space Model (SSM)** backbone, StateVLA achieves real-time capable inference while maintaining strong manipulation performance.
 
-Phase 1 (Temporal JEPA): "이 액션을 하면 세상이 어떻게 변할까?" (World Model Learning) Phase 2 (Flow Matching): "원하는 결과를 위해 어떤 액션을 해야 할까?" (Policy Learning)
+---
 
+## Method Overview
+
+### Two-Phase Training Strategy
+
+```
+Phase 1: Representation Learning
+obs_t, action_t  →  latent dynamics learning (Temporal JEPA)
+
+Phase 2: Policy Learning
+latent state z_t → continuous trajectory generation (Flow Matching)
+```
+
+This decoupled training stabilizes optimization and ensures the encoder captures physical causality before policy learning begins.
+
+---
 
 ## Architecture
 
-### Token Sequence (Mamba Causal Order)
+### Token Processing Order (Causal Mamba)
 
-[Lang(1)] → [Robot(1)] → [Agentview(196)] → [Eye-in-hand(196)] → [CLS(1)] ↑ Language FIRST: Mamba hidden state carries task context All info aggregated while processing vision patches ("뭘 찾아야 하는지 알고 봄")
+```
+[Language] → [Robot State] → [Agent View Patches]
+           → [Eye-in-Hand Patches] → [CLS]
+```
 
+* Language tokens appear first to condition all visual processing
+* CLS token is placed at the end so the final position observes the full context
+* Total sequence length: ~395 tokens
+* Embedding dimension: 256
 
-- **Vision Backbone**: Google SigLIP (ViT-B/16) - Frozen
-- **Language Backbone**: OpenAI CLIP (ViT-B/32) - Frozen
-- **Sequence**: Total ~395 tokens x 256 dim
-- **CLS Token**: Placed at the **end** (Mamba is causal: only the last position sees the full context)
+---
 
-### Phase 1: Temporal JEPA (Representation Learning)
+### Full Model Diagram
 
-obs_t → [SigLIP/CLIP] → [Lang,Robot,Vision,CLS] → Mamba Encoder (12L) → z_t ↓ z_t + a_t → TemporalPredictor → z'{t+1} ↓ obs{t+1} → [SigLIP/CLIP] → [Lang,Robot,Vision,CLS] → Target Encoder (EMA) → z_{t+1} MSE + VICReg ↑ ↓ (compare) ←──── z'_{t+1}
+```
+                ┌────────────────────────────┐
+                │   Frozen Vision Encoder     │
+                │        (SigLIP)             │
+                └─────────────┬───────────────┘
+                              │
+obs_t ──► visual tokens ───────┤
+                              │
+                ┌─────────────▼───────────────┐
+                │   Frozen Language Encoder    │
+                │            (CLIP)            │
+                └─────────────┬───────────────┘
+                              │
+                              ▼
+                    ┌─────────────────────┐
+                    │ Mamba Context Encoder│
+                    │   (State Encoder)    │
+                    └─────────┬───────────┘
+                              │
+                     latent state z_t
+                              │
+        ┌─────────────────────┴─────────────────────┐
+        │                                           │
+Phase 1 │ Temporal Predictor (JEPA)                 │
+        │                                           │
+        │ z_t + action_t → predict z'_{t+1}         │
+        │                                           │
+        └─────────────────────┬─────────────────────┘
+                              │
+Phase 2                       ▼
+                    Flow Matching Policy
+                      (Trajectory Model)
+                              │
+                              ▼
+                    Smooth Robot Actions
+```
 
+---
 
-- **Input**: Pretrained features from SigLIP (Frozen) + CLIP (Frozen)
-- **TemporalPredictor**: Residual prediction `z'_{t+1} = z_t + delta` (small action → small change)
-- **Loss**: MSE(prediction, target) + Variance regularization + Covariance decorrelation
-- **EMA**: Target encoder updated via exponential moving average (cosine schedule)
+## Phase 1 — Temporal JEPA
 
-### Phase 2: Flow Matching (Policy Learning)
+The model learns causal world dynamics in latent space:
 
-obs_t → Frozen Mamba Encoder → z_t ──┬──→ Flow Matching (Mamba 3L) → pos/rot (6D) └──→ Gripper Classifier (MLP) → gripper (1D) ↓ action [B, 10, 7]
+[
+z'_{t+1} = z_t + \Delta(z_t, a_t)
+]
 
+Loss:
 
-- Mamba Context Encoder is **frozen** from Phase 1.
-- **Position/Rotation** (6D): Iterative denoising from noise (4 Euler steps).
-- **Gripper** (1D): Binary classifier (BCE loss), separated from continuous Flow Matching.
+[
+\mathcal{L} = \text{MSE}(z'*{t+1}, z*{t+1})
 
-### Model Components
+* \lambda_v \mathcal{L}_{variance}
+* \lambda_c \mathcal{L}_{covariance}
+  ]
 
-| Component | Model | Parameters | Learnable? |
-|-----------|-------|-----------|------------|
-| **Vision Backbone** | Google SigLIP (ViT-B/16) | ~86M | ❄️ Frozen |
-| **Lang Backbone** | OpenAI CLIP (ViT-B/32) | ~87M | ❄️ Frozen |
-| **Context Encoder** | Mamba SSM (12 layers, d=256) | ~12.3M | 🔥 Trainable |
-| **Target Encoder** | EMA copy of Context Encoder | shared | ❄️ EMA Update |
-| **Temporal Predictor** | MLP (3 layers, hidden=512) | ~1.1M | 🔥 Trainable (Phase 1) |
-| **Flow Policy** | Mamba SSM (3 layers, d=256) | ~1.8M | 🔥 Trainable (Phase 2) |
-| **Total Trainable** | | **~15M** | (Lightweight!) |
+Target encoder parameters are updated using exponential moving average (EMA).
 
-### Design Decisions
+This stage produces **physics-consistent state embeddings** suitable for control.
 
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| **Backbone** | Mamba SSM | O(N) linear complexity for long sequences (395 tokens) |
-| **Tokenizer** | SigLIP + CLIP | Leverage massive pretrained knowledge (better than training from scratch) |
-| **Token Order** | Lang → Robot → Vision | Mamba is causal; language must condition vision processing |
-| **Temporal Predictor** | Residual (z_t + delta) | Easier to learn changes ($\delta$) than full states |
-| **Gripper** | Separate Classifier | Discrete actions (open/close) don't fit Flow Matching |
-| **Two-phase** | Phase 1 → freeze → Phase 2 | Establish stable world model before learning policy |
+---
 
-## Data Format
+## Phase 2 — Flow Matching Policy
 
-### LIBERO Dataset
+The encoder is frozen and used as a state representation provider:
 
-| Field | Dimension | Description |
-|-------|-----------|-------------|
-| `obs/agentview_rgb` | [T, 224, 224, 3] | Third-person camera |
-| `obs/eye_in_hand_rgb` | [T, 224, 224, 3] | Wrist camera |
-| `obs/joint_states` | [T, 7] | Joint positions |
-| `obs/gripper_states` | [T, 2] | Left/right finger positions |
-| `actions` | [T, 7] | 6D pos/rot + 1D binary gripper {-1, 1} |
-## ❓ FAQ: 왜 생성형 VLM(Qwen2.5-VL, GPT-4o 등)을 사용하지 않았나요?
+```
+obs_t → encoder → z_t → Flow Matching → action trajectory
+```
 
-거대 생성형 비전-언어 모델(Generative VLM)을 백본으로 사용하지 않은 이유에 대한 설명입니다. 핵심 이유는 **'고수준 추론(High-level Reasoning)'**과 **'저수준 운동 제어(Low-level Motor Control)'**의 역할이 다르기 때문입니다.
+Outputs:
 
-| 특징 | **StateVLA (SigLIP + Mamba)** | **생성형 VLM (Qwen2-VL, RT-2)** |
-| :--- | :--- | :--- |
-| **역할 (Role)** | **소뇌 (운동 제어)**<br>반사적이고 정교한 움직임 담당 | **전두엽 (추론/계획)**<br>상황 판단 및 작업 순서 계획 담당 |
-| **추론 속도 (Speed)** | **> 100 Hz** (실시간 제어 가능) | **1 ~ 5 Hz** (높은 지연 시간, 끊김 발생) |
-| **출력 형태 (Output)** | **연속적 임베딩 (Continuous)**<br>물리 법칙을 반영한 벡터 공간 | **이산적 토큰 (Discrete)**<br>텍스트 또는 이미지 토큰 |
-| **제어 방식** | 부드러운 관절 각도 생성 (Smooth) | 단계별 끊어지는 행동 (Step-by-step) |
+* 6D pose trajectory (continuous)
+* Binary gripper command (classifier)
 
-**결론:**
-StateVLA는 **빠르고 연속적이며, 물리적 인과관계를 이해하는 행동 생성**에 초점을 맞춥니다. 생성형 VLM은 로봇의 관절을 직접 제어(Servo Control)하기에는 너무 무겁고 느립니다.
+Final action tensor:
 
-하지만 추후 VLM이 상위 계획(Planner)을 담당하고, StateVLA가 이를 실행하는 **계층적 제어(Hierarchical Control)** 구조로 확장할 수 있도록 설계되었습니다.
+```
+[B, horizon=10, action_dim=7]
+```
+
+---
+
+## Model Components
+
+| Component          | Model           | Parameters | Trainable |
+| ------------------ | --------------- | ---------- | --------- |
+| Vision Backbone    | SigLIP ViT-B/16 | ~86M       | Frozen    |
+| Language Backbone  | CLIP ViT-B/32   | ~87M       | Frozen    |
+| Context Encoder    | Mamba SSM (12L) | ~12.3M     | Yes       |
+| Temporal Predictor | MLP             | ~1.1M      | Yes       |
+| Flow Policy        | Mamba SSM (3L)  | ~1.8M      | Yes       |
+| Total Trainable    | —               | ~15M       | —         |
+
+---
+
+## Why Not Generative VLMs?
+
+Large generative VLMs (e.g., RT-2, Qwen-VL) are powerful planners but inefficient for servo-level motor control due to:
+
+* Low inference frequency (1–5 Hz)
+* Discrete token outputs
+* High computational cost
+
+StateVLA instead functions as a **low-level controller**, enabling:
+
+* > 100 Hz inference
+* Continuous trajectory generation
+* Lightweight deployment
+
+Future systems can combine:
+
+```
+High-level Planner (VLM)
+          ↓
+StateVLA Controller
+          ↓
+Robot
+```
+
+---
+
 ## Installation
 
 ```bash
-git clone [https://github.com/Choi-In-hyuk/StateVLA.git](https://github.com/Choi-In-hyuk/StateVLA.git)
+git clone https://github.com/Choi-In-hyuk/StateVLA.git
 cd StateVLA
 
 conda create -n statevla python=3.10
 conda activate statevla
 
-# Core dependencies
 pip install torch torchvision
 pip install mamba-ssm causal-conv1d
-pip install transformers pyyaml tqdm numpy imageio h5py einops
+pip install transformers numpy einops tqdm imageio h5py
+```
 
-# LIBERO (for evaluation)
-git clone [https://github.com/Lifelong-Robot-Learning/LIBERO.git](https://github.com/Lifelong-Robot-Learning/LIBERO.git)
-cd LIBERO && pip install -e . && cd ..
-Training
-Phase 1: Temporal JEPA (World Model)
-Bash
+Install LIBERO (optional):
+
+```bash
+git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git
+cd LIBERO
+pip install -e .
+cd ..
+```
+
+---
+
+## Training
+
+### Phase 1 — Temporal JEPA
+
+```bash
 python train.py --config conf/config.yaml --phase 1
-Goal: Learn physics and causality.
+```
 
-Input: obs_t, action_t
+### Phase 2 — Flow Matching
 
-Target: obs_{t+1} (in latent space)
-
-Note: First run will download SigLIP/CLIP models automatically.
-
-Phase 2: Flow Matching (Policy)
-Bash
-python train.py --config conf/config.yaml --phase 2 \
+```bash
+python train.py \
+    --config conf/config.yaml \
+    --phase 2 \
     --phase1_checkpoint checkpoints/phase1_temporal_jepa/checkpoint_best.pt
-Goal: Learn to act based on the frozen world model.
+```
 
-Input: obs_t
+Multi-GPU:
 
-Output: action_sequence (smooth trajectory)
-
-Multi-GPU (DDP)
-Bash
+```bash
 torchrun --nproc_per_node=4 train.py --config conf/config.yaml --phase 1
-Evaluation
-Bash
-# Offline (MSE Check)
-python eval.py --checkpoint checkpoints/phase2_flow_matching/checkpoint_best.pt
+```
 
-# LIBERO Simulation (Success Rate)
+---
+
+## Evaluation
+
+Offline evaluation:
+
+```bash
+python eval.py --checkpoint checkpoints/phase2_flow_matching/checkpoint_best.pt
+```
+
+LIBERO simulation:
+
+```bash
 python run_libero_eval.py \
     --checkpoint checkpoints/phase2_flow_matching/checkpoint_best.pt \
-    --task_suite libero_object --num_trials 50
-Configuration (conf/config.yaml)
-YAML
-model:
-  # Pretrained Backbones
-  use_pretrained_vision: true
-  vision_model_name: "google/siglip-base-patch16-224"
-  use_pretrained_language: true
-  
-  # Architecture Dimensions
-  embed_dim: 256              
-  encoder_depth: 12           
-  state_dim: 256              
-  action_dim: 7               
+    --task_suite libero_object \
+    --num_trials 50
+```
 
-training:
-  phase1:
-    num_epochs: 1000
-    learning_rate: 1.0e-4
-  phase2:
-    num_epochs: 1000
-    learning_rate: 5.0e-5
-Citation
-Code snippet
+---
+
+## Citation
+
+```
 @article{statevla2025,
-  title={StateVLA: State-based Vision-Language-Action Model with Temporal JEPA},
+  title={StateVLA: State-based Vision-Language-Action Model},
   author={Choi, In-hyuk},
   year={2025}
 }
-License
+```
+
+---
+
+## License
+
 MIT License
