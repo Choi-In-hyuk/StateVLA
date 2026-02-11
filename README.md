@@ -78,7 +78,21 @@ obs_t → Frozen Mamba Encoder → z_t ──┬──→ Flow Matching (Mamba 3
 | `obs/joint_states` | [T, 7] | Joint positions |
 | `obs/gripper_states` | [T, 2] | Left/right finger positions |
 | `actions` | [T, 7] | 6D pos/rot + 1D binary gripper {-1, 1} |
+## ❓ FAQ: 왜 생성형 VLM(Qwen2.5-VL, GPT-4o 등)을 사용하지 않았나요?
 
+거대 생성형 비전-언어 모델(Generative VLM)을 백본으로 사용하지 않은 이유에 대한 설명입니다. 핵심 이유는 **'고수준 추론(High-level Reasoning)'**과 **'저수준 운동 제어(Low-level Motor Control)'**의 역할이 다르기 때문입니다.
+
+| 특징 | **StateVLA (SigLIP + Mamba)** | **생성형 VLM (Qwen2-VL, RT-2)** |
+| :--- | :--- | :--- |
+| **역할 (Role)** | **소뇌 (운동 제어)**<br>반사적이고 정교한 움직임 담당 | **전두엽 (추론/계획)**<br>상황 판단 및 작업 순서 계획 담당 |
+| **추론 속도 (Speed)** | **> 100 Hz** (실시간 제어 가능) | **1 ~ 5 Hz** (높은 지연 시간, 끊김 발생) |
+| **출력 형태 (Output)** | **연속적 임베딩 (Continuous)**<br>물리 법칙을 반영한 벡터 공간 | **이산적 토큰 (Discrete)**<br>텍스트 또는 이미지 토큰 |
+| **제어 방식** | 부드러운 관절 각도 생성 (Smooth) | 단계별 끊어지는 행동 (Step-by-step) |
+
+**결론:**
+StateVLA는 **빠르고 연속적이며, 물리적 인과관계를 이해하는 행동 생성**에 초점을 맞춥니다. 생성형 VLM은 로봇의 관절을 직접 제어(Servo Control)하기에는 너무 무겁고 느립니다.
+
+하지만 추후 VLM이 상위 계획(Planner)을 담당하고, StateVLA가 이를 실행하는 **계층적 제어(Hierarchical Control)** 구조로 확장할 수 있도록 설계되었습니다.
 ## Installation
 
 ```bash
