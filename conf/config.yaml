@@ -1,10 +1,4 @@
 # StateVLA Two-Phase Training Configuration
-#
-# Phase 1: Temporal JEPA (representation learning)
-#   python train.py --config conf/config.yaml --phase 1
-#
-# Phase 2: Flow Matching (policy learning)
-#   python train.py --config conf/config.yaml --phase 2 --phase1_checkpoint <path>
 
 # ============= Data Configuration =============
 data:
@@ -20,6 +14,14 @@ model:
   patch_size: 16  # 14x14 = 196 patches per image
   embed_dim: 256
 
+  # [추가됨] Pretrained Backbone Configuration (SigLIP & CLIP)
+  use_pretrained_vision: true
+  use_pretrained_language: true
+  vision_model_name: "google/siglip-base-patch16-224"
+  language_model_name: "ViT-B/32"
+  freeze_vision: true
+  freeze_language: true
+
   # Language
   lang_emb_dim: 512
 
@@ -32,11 +34,11 @@ model:
   d_conv: 4
   expand: 2
 
-  # Legacy JEPA Predictor Configuration (kept for compatibility)
+  # Legacy JEPA Predictor Configuration
   predictor_embed_dim: 192
   predictor_depth: 6
 
-  # Masking Configuration (legacy, not used in temporal JEPA)
+  # Masking Configuration
   mask_ratio: 0.5
   masking_strategy: "modality_aware"
 
@@ -54,7 +56,7 @@ model:
 # ============= Training Configuration =============
 training:
   batch_size: 64
-  num_epochs: 2000  # Default, overridden by phase-specific config
+  num_epochs: 2000
   learning_rate: 1.0e-4
   weight_decay: 0.05
   gradient_clip: 1.0
@@ -69,9 +71,8 @@ training:
 
   # EMA Target Encoder Configuration
   ema_momentum: 0.996
-  ema_momentum_schedule: "cosine"  # constant or cosine
+  ema_momentum_schedule: "cosine"
 
-  # Learning Rate Scheduler
   use_lr_scheduler: false
   min_lr: 1.0e-6
 
@@ -81,8 +82,6 @@ training:
   # Checkpointing
   save_interval: 100
   checkpoint_dir: "checkpoints"
-
-  # Logging
   log_interval: 10
 
   # ---- Phase 1: Temporal JEPA ----
@@ -95,14 +94,13 @@ training:
   phase2:
     num_epochs: 1000
     learning_rate: 5.0e-5
-    phase1_checkpoint: null  # Set via --phase1_checkpoint or here
+    phase1_checkpoint: null
 
-# ============= Camera Configuration =============
+# ============= Camera & Device =============
 cameras:
   names:
     - "agentview"
     - "eye_in_hand"
 
-# ============= Device Configuration =============
-device: "cuda"  # cuda or cpu
+device: "cuda"
 seed: 42
