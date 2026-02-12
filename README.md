@@ -237,35 +237,48 @@ Cosine momentum schedule:
 
 > "주어진 상태 z_t에서, 어떤 action trajectory를 생성해야 할까?"
 
-Encoder는 Phase 1에서 학습된 가중치로 **완전히 freeze**하고, action 생성 모듈만 학습.
+Encoder + Temporal Predictor는 Phase 1에서 학습된 가중치로 **완전히 freeze**하고, action 생성 모듈만 학습. Phase 1에서 학습한 **미래 상태 예측(z'_{t+1})을 Flow Matching의 conditioning으로 활용**하여, policy가 "미래를 보고" action을 생성.
 
 ### Forward Pass
 
 ```
 obs_t ──→ Frozen Encoder ──→ z_t (256D, no gradient)
                                │
-                  ┌────────────┴────────────┐
-                  ▼                         ▼
-       ┌─────────────────┐      ┌──────────────────┐
-       │  Flow Matching   │      │ Gripper Classifier│
-       │  (Mamba 3L)      │      │ (MLP)            │
-       │                  │      │                   │
-       │  Input tokens:   │      │ z_t               │
-       │  [σ_emb(1),      │      │   → Linear(256)   │
-       │   z_emb(1),      │      │   → SiLU           │
-       │   a_noisy(10)]   │      │   → Linear(256)   │
-       │  = 12 tokens     │      │   → SiLU           │
-       │                  │      │   → Linear(10)    │
-       │  Mamba 3L        │      │  = 10 logits      │
-       │  → MLP head      │      │                   │
-       │  → velocity(6D)  │      │ Loss: BCE          │
-       │                  │      │                   │
+                               ├──→ Frozen Temporal Predictor
+                               │         │
+                               │    z_t + a_t(first action)
+                               │         │
+                               │         ▼
+                               │    z'_{t+1} (predicted next state, no gradient)
+                               │         │
+                  ┌────────────┴─────────┘
+                  │
+                  ▼
+       ┌─────────────────┐
+       │  Flow Matching   │      ┌──────────────────┐
+       │  (Mamba 3L)      │      │ Gripper Classifier│
+       │                  │      │ (MLP)            │
+       │  Input tokens:   │      │                   │
+       │  [σ_emb(1),      │      │ z_t               │
+       │   z'_{t+1}(1),   │      │   → Linear(256)   │
+       │   a_noisy(10)]   │      │   → SiLU           │
+       │  = 12 tokens     │      │   → Linear(256)   │
+       │                  │      │   → SiLU           │
+       │  Mamba 3L        │      │   → Linear(10)    │
+       │  → MLP head      │      │  = 10 logits      │
+       │  → velocity(6D)  │      │                   │
+       │                  │      │ Loss: BCE          │
        │  Loss: MSE       │      └────────┬─────────┘
        └────────┬─────────┘               │
                 └──────┬──────────────────┘
                        ▼
              [pos_rot(6D), gripper(1D)] × 10 steps = action [B, 10, 7]
 ```
+
+**z_t 대신 z'_{t+1}를 conditioning으로 사용하는 이유:**
+- Phase 1에서 학습한 Temporal Predictor의 "물리 인과성 지식"을 활용
+- z'_{t+1}은 "이 action을 하면 세계가 어떻게 변할까"에 대한 정보를 담고 있음
+- policy가 미래 상태를 보고 더 정확한 action trajectory를 생성할 수 있음
 
 ### Loss Function (Phase 2)
 
@@ -280,6 +293,11 @@ Flow Matching은 noise에서 시작하여 ground truth action으로 향하는 **
 **학습 과정 (Training):**
 
 ```python
+# Step 0: Frozen encoder + temporal predictor로 conditioning 생성
+z_t = FrozenEncoder(obs_t)                  # [B, 256]
+a_t = gt_actions[:, 0, :]                   # [B, 7] first action in chunk
+z_next = FrozenTemporalPredictor(z_t, a_t)  # [B, 256] predicted next state
+
 # Step 1: Diffusion timestep 샘플링
 σ ~ Uniform(0, 1)                           # [B]
 
@@ -294,8 +312,8 @@ x_noisy = (1 - σ) · x_0 + σ · ε            # x_0 = ground truth pos/rot [B,
 # Step 4: Target velocity 계산 (optimal transport 방향)
 v_target = ε - x_0                          # noise에서 data로 향하는 방향의 반대
 
-# Step 5: Mamba policy가 velocity 예측
-v_pred = FlowMatchingPolicy(σ, z_t, x_noisy)  # [B, 10, 6]
+# Step 5: Mamba policy가 velocity 예측 (z'_{t+1}로 conditioning)
+v_pred = FlowMatchingPolicy(σ, z_next, x_noisy)  # [B, 10, 6]
 ```
 
 **Loss:**
@@ -354,11 +372,16 @@ gripper_loss = F.binary_cross_entropy_with_logits(
 학습된 velocity field를 사용하여 pure noise에서 clean action을 **iterative하게 복원**:
 
 ```python
+# Conditioning 생성
+z_t = FrozenEncoder(obs_t)                  # [B, 256]
+zero_action = zeros(B, 7)                   # normalized mean action ≈ 0
+z_next = FrozenTemporalPredictor(z_t, zero_action)  # [B, 256]
+
 # Euler method sampling (4 steps)
 x = N(0, I)                                 # Start from pure noise [B, 10, 6]
 
 for t in [1.0, 0.75, 0.5, 0.25]:            # 4 denoising steps
-    v = FlowMatchingPolicy(t, z_t, x)       # predict velocity at noise level t
+    v = FlowMatchingPolicy(t, z_next, x)    # z'_{t+1}로 conditioning
     x = x - (1/4) · v                       # Euler step: move toward clean data
 
 # Gripper: independent binary prediction (no denoising needed)
@@ -368,6 +391,8 @@ gripper = where(logits > 0, +1, -1)         # [B, 10, 1]
 # Combine
 action = concat(x, gripper, dim=-1)         # [B, 10, 7]
 ```
+
+**Inference에서 zero action을 사용하는 이유:** Action이 zero-mean으로 정규화되어 있으므로 zero = 평균 action. Temporal Predictor가 "평균적 행동을 했을 때의 미래 상태"를 예측하여 conditioning으로 제공.
 
 | Step | $t$ | State of $x$ |
 |------|-----|-------------|

@@ -9,7 +9,8 @@ Phase 1 - Temporal JEPA (표현 학습):
 
 Phase 2 - Flow Matching (정책 학습):
   obs_t → FrozenEncoder → z_t
-  z_t → FlowMatchingPolicy → a_t
+  z_t + a_t → FrozenTemporalPredictor → z'_{t+1}  (Phase 1에서 학습한 미래 예측)
+  z'_{t+1} → FlowMatchingPolicy → a_t
   Loss: FlowMatching(velocity) + BCE(gripper)
 """
 
@@ -188,7 +189,11 @@ class StateVLA(nn.Module):
         # Encode state (frozen encoder)
         with torch.no_grad():
             state_outputs = self.state_encoder(obs_dict)
-        z_t = state_outputs["z_t"]
+            z_t = state_outputs["z_t"]
+
+            # Use Temporal Predictor for z'_{t+1} conditioning (frozen, from Phase 1)
+            a_t = gt_actions[:, 0, :]  # First action in chunk
+            z_next_pred = self.state_encoder.temporal_predictor(z_t, a_t)
 
         outputs = {"z_t": z_t}
 
@@ -208,11 +213,11 @@ class StateVLA(nn.Module):
         noisy_actions = torch.cat([noisy_pos_rot, dummy_gripper], dim=-1)
 
         # Predict velocity and gripper logits
-        z_next_dummy = torch.zeros_like(z_t)
-        error_dummy = torch.zeros_like(z_t)
+        # z_next_pred: Phase 1이 학습한 "미래 상태 예측"을 policy conditioning으로 활용
+        error = z_next_pred - z_t
 
         velocity, gripper_logits = self.action_policy(
-            z_t, z_t, error_dummy, noisy_actions, sigma
+            z_t, z_next_pred, error, noisy_actions, sigma
         )
 
         outputs["velocity"] = velocity
@@ -270,12 +275,13 @@ class StateVLA(nn.Module):
         # Encode state
         z_t = self.state_encoder.encode(obs_dict)
 
-        # Generate actions
-        z_next_dummy = torch.zeros_like(z_t)
-        error_dummy = torch.zeros_like(z_t)
+        # Use Temporal Predictor with zero action (= mean action for normalized data)
+        zero_action = torch.zeros(z_t.shape[0], self.action_dim, device=z_t.device)
+        z_next_pred = self.state_encoder.temporal_predictor(z_t, zero_action)
+        error = z_next_pred - z_t
 
         actions = self.action_policy.generate_actions(
-            z_t, z_t, error_dummy, sample_steps
+            z_t, z_next_pred, error, sample_steps
         )
 
         # Denormalize pos/rot actions
