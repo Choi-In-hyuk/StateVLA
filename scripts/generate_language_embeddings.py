@@ -138,7 +138,7 @@ def main():
                         help='Path to LIBERO dataset directory (e.g., libero_object)')
     parser.add_argument('--output_path', type=str, default=None,
                         help='Output path for embeddings pickle file')
-    parser.add_argument('--encoder', type=str, default='qwen',
+    parser.add_argument('--encoder', type=str, default='clip',
                         choices=['qwen', 'clip'],
                         help='Encoder type: qwen or clip')
     parser.add_argument('--model_name', type=str, default=None,

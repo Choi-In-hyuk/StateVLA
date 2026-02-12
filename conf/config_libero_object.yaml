@@ -16,7 +16,7 @@ model:
   embed_dim: 256
 
   # Language
-  lang_emb_dim: 3584  # Qwen embedding dimension (from dataloader)
+  lang_emb_dim: 512  # CLIP embedding dimension
 
   # Robot State
   robot_state_dim: 9  # joint_states(7) + gripper_states(2)

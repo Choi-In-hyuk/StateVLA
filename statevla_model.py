@@ -34,7 +34,7 @@ class StateVLA(nn.Module):
     def __init__(
         self,
         # Tokenizer config
-        camera_names: List[str] = ['agentview', 'eye_in_hand'],
+        camera_names: List[str] = ["agentview", "eye_in_hand"],
         image_size: int = 224,
         patch_size: int = 16,
         embed_dim: int = 256,
@@ -57,7 +57,7 @@ class StateVLA(nn.Module):
         predictor_depth: int = 6,
         # Masking config (legacy, kept for compatibility)
         mask_ratio: float = 0.5,
-        masking_strategy: str = 'modality_aware',
+        masking_strategy: str = "modality_aware",
         # State config
         state_dim: int = 256,
         # Action config
@@ -71,7 +71,7 @@ class StateVLA(nn.Module):
         # Training phase
         training_phase: int = 1,
         # Device
-        device: str = 'cuda',
+        device: str = "cuda",
     ):
         super().__init__()
 
@@ -122,8 +122,8 @@ class StateVLA(nn.Module):
         )
 
         # Action normalization buffers (pos/rot only, 6 dims)
-        self.register_buffer('action_mean', torch.zeros(6))
-        self.register_buffer('action_std', torch.ones(6))
+        self.register_buffer("action_mean", torch.zeros(6))
+        self.register_buffer("action_std", torch.ones(6))
 
     def set_action_stats(self, mean: torch.Tensor, std: torch.Tensor):
         """Set action normalization statistics from dataset."""
@@ -188,9 +188,9 @@ class StateVLA(nn.Module):
         # Encode state (frozen encoder)
         with torch.no_grad():
             state_outputs = self.state_encoder(obs_dict)
-        z_t = state_outputs['z_t']
+        z_t = state_outputs["z_t"]
 
-        outputs = {'z_t': z_t}
+        outputs = {"z_t": z_t}
 
         # Split actions: pos/rot (6 dims) and gripper (1 dim)
         pos_rot_actions = gt_actions[:, :, :6]
@@ -202,7 +202,9 @@ class StateVLA(nn.Module):
         noisy_pos_rot = (1 - sigma_expanded) * pos_rot_actions + sigma_expanded * noise
 
         # Create full noisy actions with dummy gripper
-        dummy_gripper = torch.zeros(batch_size, gt_actions.shape[1], 1, device=z_t.device)
+        dummy_gripper = torch.zeros(
+            batch_size, gt_actions.shape[1], 1, device=z_t.device
+        )
         noisy_actions = torch.cat([noisy_pos_rot, dummy_gripper], dim=-1)
 
         # Predict velocity and gripper logits
@@ -210,13 +212,13 @@ class StateVLA(nn.Module):
         error_dummy = torch.zeros_like(z_t)
 
         velocity, gripper_logits = self.action_policy(
-            z_t, z_next_dummy, error_dummy, noisy_actions, sigma
+            z_t, z_t, error_dummy, noisy_actions, sigma
         )
 
-        outputs['velocity'] = velocity
-        outputs['noise'] = noise
-        outputs['gripper_logits'] = gripper_logits
-        outputs['gripper_targets'] = gripper_actions
+        outputs["velocity"] = velocity
+        outputs["noise"] = noise
+        outputs["gripper_logits"] = gripper_logits
+        outputs["gripper_targets"] = gripper_actions
 
         return outputs
 
@@ -234,14 +236,18 @@ class StateVLA(nn.Module):
         Phase 1: requires next_obs_dict, action
         Phase 2: requires gt_actions, sigma
         """
-        if self.training_phase == 1 and next_obs_dict is not None and action is not None:
+        if (
+            self.training_phase == 1
+            and next_obs_dict is not None
+            and action is not None
+        ):
             return self.forward_phase1(obs_dict, next_obs_dict, action)
         elif gt_actions is not None and sigma is not None:
             return self.forward_phase2(obs_dict, gt_actions, sigma)
         else:
             # Inference / encode only
             state_outputs = self.state_encoder(obs_dict)
-            return {'z_t': state_outputs['z_t']}
+            return {"z_t": state_outputs["z_t"]}
 
     @torch.no_grad()
     def predict(
@@ -269,7 +275,7 @@ class StateVLA(nn.Module):
         error_dummy = torch.zeros_like(z_t)
 
         actions = self.action_policy.generate_actions(
-            z_t, z_next_dummy, error_dummy, sample_steps
+            z_t, z_t, error_dummy, sample_steps
         )
 
         # Denormalize pos/rot actions
@@ -319,7 +325,7 @@ class StateVLATrainer(nn.Module):
         variance_weight: float = 1.0,
         covariance_weight: float = 0.04,
         ema_momentum: float = 0.996,
-        ema_momentum_schedule: str = 'cosine',
+        ema_momentum_schedule: str = "cosine",
     ):
         super().__init__()
         self.model = model
@@ -357,7 +363,9 @@ class StateVLATrainer(nn.Module):
 
         # Gripper BCE loss (convert from {-1, 1} to {0, 1})
         gripper_binary = (gripper_targets > 0).float()
-        gripper_loss = F.binary_cross_entropy_with_logits(gripper_logits, gripper_binary)
+        gripper_loss = F.binary_cross_entropy_with_logits(
+            gripper_logits, gripper_binary
+        )
 
         total_loss = pos_rot_loss + gripper_loss
         return total_loss, pos_rot_loss, gripper_loss
@@ -387,24 +395,24 @@ class StateVLATrainer(nn.Module):
 
         # Temporal JEPA loss
         jepa_losses = compute_temporal_jepa_loss(
-            outputs['z_next_pred'],
-            outputs['z_next_target'],
+            outputs["z_next_pred"],
+            outputs["z_next_target"],
             variance_weight=self.variance_weight,
             covariance_weight=self.covariance_weight,
         )
 
-        total_loss = self.jepa_loss_weight * jepa_losses['total']
+        total_loss = self.jepa_loss_weight * jepa_losses["total"]
 
         return {
-            'loss': total_loss,
-            'jepa_loss': jepa_losses['total'],
-            'jepa_mse': jepa_losses['mse'],
-            'jepa_variance': jepa_losses['variance'],
-            'jepa_covariance': jepa_losses['covariance'],
-            'action_loss': torch.tensor(0.0, device=total_loss.device),
-            'pos_rot_loss': torch.tensor(0.0, device=total_loss.device),
-            'gripper_loss': torch.tensor(0.0, device=total_loss.device),
-            'z_t': outputs['z_t'],
+            "loss": total_loss,
+            "jepa_loss": jepa_losses["total"],
+            "jepa_mse": jepa_losses["mse"],
+            "jepa_variance": jepa_losses["variance"],
+            "jepa_covariance": jepa_losses["covariance"],
+            "action_loss": torch.tensor(0.0, device=total_loss.device),
+            "pos_rot_loss": torch.tensor(0.0, device=total_loss.device),
+            "gripper_loss": torch.tensor(0.0, device=total_loss.device),
+            "z_t": outputs["z_t"],
         }
 
     def forward_phase2(
@@ -432,25 +440,25 @@ class StateVLATrainer(nn.Module):
 
         # Action loss
         action_loss, pos_rot_loss, gripper_loss = self.compute_action_loss(
-            outputs['velocity'],
-            outputs['noise'],
+            outputs["velocity"],
+            outputs["noise"],
             gt_actions[:, :, :6],
-            outputs['gripper_logits'],
-            outputs['gripper_targets'],
+            outputs["gripper_logits"],
+            outputs["gripper_targets"],
         )
 
         total_loss = self.action_loss_weight * action_loss
 
         return {
-            'loss': total_loss,
-            'jepa_loss': torch.tensor(0.0, device=device),
-            'jepa_mse': torch.tensor(0.0, device=device),
-            'jepa_variance': torch.tensor(0.0, device=device),
-            'jepa_covariance': torch.tensor(0.0, device=device),
-            'action_loss': action_loss,
-            'pos_rot_loss': pos_rot_loss,
-            'gripper_loss': gripper_loss,
-            'z_t': outputs['z_t'],
+            "loss": total_loss,
+            "jepa_loss": torch.tensor(0.0, device=device),
+            "jepa_mse": torch.tensor(0.0, device=device),
+            "jepa_variance": torch.tensor(0.0, device=device),
+            "jepa_covariance": torch.tensor(0.0, device=device),
+            "action_loss": action_loss,
+            "pos_rot_loss": pos_rot_loss,
+            "gripper_loss": gripper_loss,
+            "z_t": outputs["z_t"],
         }
 
     def forward(
@@ -470,18 +478,21 @@ class StateVLATrainer(nn.Module):
         Phase 2: requires gt_actions
         """
         if self.model.training_phase == 1:
-            return self.forward_phase1(obs_dict, next_obs_dict, action, step, total_steps)
+            return self.forward_phase1(
+                obs_dict, next_obs_dict, action, step, total_steps
+            )
         else:
             return self.forward_phase2(obs_dict, gt_actions)
 
     def update_target_encoder(self, step: int, total_steps: int):
         """Update target encoder with scheduled momentum."""
-        if self.ema_momentum_schedule == 'cosine':
+        if self.ema_momentum_schedule == "cosine":
             import math
+
             progress = step / total_steps
-            momentum = 1.0 - (1.0 - self.ema_momentum) * (
-                1 + math.cos(math.pi * progress)
-            ) / 2
+            momentum = (
+                1.0 - (1.0 - self.ema_momentum) * (1 + math.cos(math.pi * progress)) / 2
+            )
         else:
             momentum = self.ema_momentum
 

@@ -9,6 +9,7 @@ This module implements the Residual Action Policy:
 
 import os
 import sys
+
 _project_root = os.path.dirname(os.path.abspath(__file__))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
@@ -69,7 +70,9 @@ class GripperClassifier(nn.Module):
         """
         logits = self.forward(z)
         # Convert to -1 (open) or 1 (close)
-        gripper = torch.where(logits > 0, torch.ones_like(logits), -torch.ones_like(logits))
+        gripper = torch.where(
+            logits > 0, torch.ones_like(logits), -torch.ones_like(logits)
+        )
         return gripper.unsqueeze(-1)  # [B, action_seq_len, 1]
 
 
@@ -92,7 +95,7 @@ class FlowMatchingPolicy(nn.Module):
         n_layer: int = 3,
         d_intermediate: int = 256,
         ssm_cfg: Optional[dict] = None,
-        device: str = 'cuda'
+        device: str = "cuda",
     ):
         super().__init__()
 
@@ -102,12 +105,7 @@ class FlowMatchingPolicy(nn.Module):
         self.embed_dim = embed_dim
 
         if ssm_cfg is None:
-            ssm_cfg = {
-                "layer": "Mamba1",
-                "d_state": 64,
-                "d_conv": 4,
-                "expand": 2
-            }
+            ssm_cfg = {"layer": "Mamba1", "d_state": 64, "d_conv": 4, "expand": 2}
 
         # State projection
         self.state_proj = nn.Linear(state_dim, embed_dim)
@@ -131,7 +129,7 @@ class FlowMatchingPolicy(nn.Module):
             ssm_cfg=ssm_cfg,
             rms_norm=True,
             device=device,
-            dtype=torch.float32
+            dtype=torch.float32,
         )
 
         # Action prediction head
@@ -139,14 +137,14 @@ class FlowMatchingPolicy(nn.Module):
             input_dim=embed_dim,
             output_dim=action_dim,
             hidden_dim=embed_dim,
-            num_layers=2
+            num_layers=2,
         )
 
     def forward(
         self,
         z_next_pred: torch.Tensor,
         noisy_actions: torch.Tensor,
-        sigma: torch.Tensor
+        sigma: torch.Tensor,
     ) -> torch.Tensor:
         """
         Forward pass for training (predicts velocity for flow matching).
@@ -180,7 +178,9 @@ class FlowMatchingPolicy(nn.Module):
         output = self.backbone(seq)  # [B, seq_len, embed_dim]
 
         # Extract action tokens (last action_seq_len tokens)
-        action_output = output[:, -self.action_seq_len:, :]  # [B, action_seq_len, embed_dim]
+        action_output = output[
+            :, -self.action_seq_len :, :
+        ]  # [B, action_seq_len, embed_dim]
 
         # Predict velocity
         velocity = self.action_pred(action_output)  # [B, action_seq_len, action_dim]
@@ -189,10 +189,7 @@ class FlowMatchingPolicy(nn.Module):
 
     @torch.no_grad()
     def generate(
-        self,
-        z_next_pred: torch.Tensor,
-        sample_steps: int = 4,
-        cfg_scale: float = 1.0
+        self, z_next_pred: torch.Tensor, sample_steps: int = 4, cfg_scale: float = 1.0
     ) -> torch.Tensor:
         """
         Generate actions using flow matching sampling.
@@ -210,8 +207,7 @@ class FlowMatchingPolicy(nn.Module):
 
         # Start from noise
         actions = torch.randn(
-            batch_size, self.action_seq_len, self.action_dim,
-            device=device
+            batch_size, self.action_seq_len, self.action_dim, device=device
         )
 
         # Iterative denoising
@@ -241,7 +237,7 @@ class CorrectionMLP(nn.Module):
         action_dim: int = 7,
         action_seq_len: int = 10,
         hidden_dim: int = 512,
-        dropout: float = 0.1
+        dropout: float = 0.1,
     ):
         super().__init__()
 
@@ -258,7 +254,7 @@ class CorrectionMLP(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, action_dim * action_seq_len)
+            nn.Linear(hidden_dim, action_dim * action_seq_len),
         )
 
         # Initialize last layer with small weights
@@ -312,7 +308,7 @@ class ActionPolicy(nn.Module):
         correction_hidden_dim: int = 512,
         ssm_cfg: Optional[dict] = None,
         use_correction: bool = True,
-        device: str = 'cuda'
+        device: str = "cuda",
     ):
         super().__init__()
 
@@ -332,7 +328,7 @@ class ActionPolicy(nn.Module):
             n_layer=n_layer,
             d_intermediate=d_intermediate,
             ssm_cfg=ssm_cfg,
-            device=device
+            device=device,
         )
 
         # Gripper classifier (separate binary head)
@@ -348,13 +344,12 @@ class ActionPolicy(nn.Module):
                 state_dim=state_dim,
                 action_dim=self.pos_rot_dim,  # 6 dims only
                 action_seq_len=action_seq_len,
-                hidden_dim=correction_hidden_dim
+                hidden_dim=correction_hidden_dim,
             )
+            # Learnable correction weight
+            self.correction_weight = nn.Parameter(torch.tensor(0.1))
         else:
             self.correction = None
-
-        # Learnable correction weight
-        self.correction_weight = nn.Parameter(torch.tensor(0.1))
 
     def forward(
         self,
@@ -362,7 +357,7 @@ class ActionPolicy(nn.Module):
         z_next_pred: torch.Tensor,
         error: torch.Tensor,
         noisy_actions: torch.Tensor,
-        sigma: torch.Tensor
+        sigma: torch.Tensor,
     ) -> tuple:
         """
         Forward pass for training.
@@ -379,7 +374,7 @@ class ActionPolicy(nn.Module):
             gripper_logits: [B, action_seq_len] gripper logits
         """
         # Extract position/rotation part of noisy actions (first 6 dims)
-        noisy_pos_rot = noisy_actions[:, :, :self.pos_rot_dim]
+        noisy_pos_rot = noisy_actions[:, :, : self.pos_rot_dim]
 
         # Base policy velocity for position/rotation
         velocity = self.base_policy(z_next_pred, noisy_pos_rot, sigma)
@@ -400,7 +395,7 @@ class ActionPolicy(nn.Module):
         z_t: torch.Tensor,
         z_next_pred: torch.Tensor,
         error: torch.Tensor,
-        sample_steps: int = 4
+        sample_steps: int = 4,
     ) -> torch.Tensor:
         """
         Generate actions at inference time.
@@ -419,8 +414,7 @@ class ActionPolicy(nn.Module):
 
         # Start from noise for position/rotation only
         pos_rot_actions = torch.randn(
-            batch_size, self.action_seq_len, self.pos_rot_dim,  # 6 dims
-            device=device
+            batch_size, self.action_seq_len, self.pos_rot_dim, device=device  # 6 dims
         )
 
         # Iterative denoising for position/rotation
@@ -431,7 +425,9 @@ class ActionPolicy(nn.Module):
             sigma = torch.full((batch_size,), t, device=device)
 
             # Create dummy full actions for forward pass
-            dummy_gripper = torch.zeros(batch_size, self.action_seq_len, 1, device=device)
+            dummy_gripper = torch.zeros(
+                batch_size, self.action_seq_len, 1, device=device
+            )
             full_actions = torch.cat([pos_rot_actions, dummy_gripper], dim=-1)
 
             # Predict velocity (only for pos/rot)
@@ -444,7 +440,9 @@ class ActionPolicy(nn.Module):
         gripper_actions = self.gripper_head.predict(z_t)  # [B, action_seq_len, 1]
 
         # Combine position/rotation and gripper
-        actions = torch.cat([pos_rot_actions, gripper_actions], dim=-1)  # [B, seq_len, 7]
+        actions = torch.cat(
+            [pos_rot_actions, gripper_actions], dim=-1
+        )  # [B, seq_len, 7]
 
         return actions
 
@@ -457,11 +455,7 @@ class ActionFlowMatching(nn.Module):
     and action generation during inference.
     """
 
-    def __init__(
-        self,
-        policy: ActionPolicy,
-        ln: bool = False
-    ):
+    def __init__(self, policy: ActionPolicy, ln: bool = False):
         super().__init__()
         self.policy = policy
         self.ln = ln  # Use log-normal timestep sampling
@@ -471,7 +465,7 @@ class ActionFlowMatching(nn.Module):
         actions: torch.Tensor,
         z_t: torch.Tensor,
         z_next_pred: torch.Tensor,
-        error: torch.Tensor
+        error: torch.Tensor,
     ) -> tuple:
         """
         Compute flow matching loss for pos/rot and BCE loss for gripper.
@@ -492,7 +486,7 @@ class ActionFlowMatching(nn.Module):
 
         # Split actions into pos/rot and gripper
         pos_rot_actions = actions[:, :, :6]  # [B, seq_len, 6]
-        gripper_actions = actions[:, :, 6]   # [B, seq_len]
+        gripper_actions = actions[:, :, 6]  # [B, seq_len]
 
         # --- Position/Rotation Flow Matching Loss ---
         # Sample timesteps
@@ -509,14 +503,18 @@ class ActionFlowMatching(nn.Module):
         noise = torch.randn_like(pos_rot_actions)
 
         # Interpolate: x_t = (1 - t) * x_0 + t * noise
-        interpolated_pos_rot = (1 - time_expanded) * pos_rot_actions + time_expanded * noise
+        interpolated_pos_rot = (
+            1 - time_expanded
+        ) * pos_rot_actions + time_expanded * noise
 
         # Add dummy gripper for full action tensor
         dummy_gripper = torch.zeros(batch_size, actions.shape[1], 1, device=device)
         interpolated = torch.cat([interpolated_pos_rot, dummy_gripper], dim=-1)
 
         # Predict velocity and gripper logits
-        velocity_pred, gripper_logits = self.policy(z_t, z_next_pred, error, interpolated, time_steps)
+        velocity_pred, gripper_logits = self.policy(
+            z_t, z_next_pred, error, interpolated, time_steps
+        )
 
         # Target velocity for pos/rot: noise - actions
         target_velocity = noise - pos_rot_actions
@@ -544,7 +542,7 @@ class ActionFlowMatching(nn.Module):
         z_t: torch.Tensor,
         z_next_pred: torch.Tensor,
         error: torch.Tensor,
-        sample_steps: int = 4
+        sample_steps: int = 4,
     ) -> torch.Tensor:
         """
         Generate actions using the policy.

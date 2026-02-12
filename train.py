@@ -1,11 +1,14 @@
 """
-StateVLA Two-Phase Training Script
+StateVLA Two-Phase Training Script (Single-GPU & DDP)
 
 Phase 1: Temporal JEPA (representation learning)
     python train.py --config conf/config.yaml --phase 1
 
 Phase 2: Flow Matching (policy learning)
     python train.py --config conf/config.yaml --phase 2 --phase1_checkpoint checkpoints/phase1/checkpoint_best.pt
+
+Multi-GPU (DDP):
+    torchrun --nproc_per_node=2 train.py --config conf/config.yaml --phase 1
 """
 
 import os
@@ -16,8 +19,11 @@ from datetime import datetime
 
 import numpy as np
 import torch
-import yaml
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+import yaml
 from tqdm import tqdm
 
 import sys
@@ -31,6 +37,52 @@ from dataloader import create_dataloader
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
+
+# ==================== DDP Utilities ====================
+
+def is_ddp():
+    """Check if running in DDP mode."""
+    return dist.is_initialized()
+
+
+def get_rank():
+    """Get current process rank (0 if not DDP)."""
+    return dist.get_rank() if is_ddp() else 0
+
+
+def get_world_size():
+    """Get total number of processes (1 if not DDP)."""
+    return dist.get_world_size() if is_ddp() else 1
+
+
+def is_main_process():
+    """Check if this is the main process (rank 0)."""
+    return get_rank() == 0
+
+
+def setup_ddp():
+    """Initialize DDP if launched via torchrun."""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
+
+        if rank == 0:
+            log.info(f"DDP initialized: {world_size} GPUs")
+        return local_rank
+    return 0
+
+
+def cleanup_ddp():
+    """Clean up DDP."""
+    if is_ddp():
+        dist.destroy_process_group()
+
+
+# ==================== Core Functions ====================
 
 def set_seed(seed: int):
     """Set random seed for reproducibility."""
@@ -57,12 +109,18 @@ def save_checkpoint(
     is_best: bool = False,
     save_epoch_checkpoint: bool = False
 ):
-    """Save model checkpoint."""
+    """Save model checkpoint (only on rank 0)."""
+    if not is_main_process():
+        return
+
     os.makedirs(checkpoint_dir, exist_ok=True)
+
+    # Unwrap DDP model for saving
+    model_to_save = model.module if isinstance(model, DDP) else model
 
     checkpoint = {
         'epoch': epoch,
-        'model_state_dict': model.state_dict(),
+        'model_state_dict': model_to_save.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'loss': loss,
         'config': config
@@ -87,7 +145,7 @@ def save_checkpoint(
 
 
 def train_epoch_phase1(
-    trainer: StateVLATrainer,
+    trainer,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: str,
@@ -105,7 +163,8 @@ def train_epoch_phase1(
     num_batches = 0
     current_step = global_step
 
-    pbar = tqdm(dataloader, desc=f"[Phase 1] Epoch {epoch}")
+    # Only show progress bar on main process
+    pbar = tqdm(dataloader, desc=f"[Phase 1] Epoch {epoch}", disable=not is_main_process())
 
     for batch in pbar:
         # Move data to device
@@ -115,7 +174,6 @@ def train_epoch_phase1(
         # Get next observation
         next_obs = batch.get('next_obs')
         if next_obs is None:
-            # Skip batches without next_obs
             continue
         next_obs = {k: v.to(device) for k, v in next_obs.items()}
 
@@ -124,7 +182,10 @@ def train_epoch_phase1(
 
         # Forward pass
         optimizer.zero_grad()
-        outputs = trainer(
+
+        # Access underlying trainer for DDP-wrapped models
+        trainer_module = trainer.module if isinstance(trainer, DDP) else trainer
+        outputs = trainer_module(
             obs_dict=obs,
             next_obs_dict=next_obs,
             action=a_t,
@@ -146,8 +207,8 @@ def train_epoch_phase1(
 
         optimizer.step()
 
-        # Update target encoder (EMA)
-        trainer.update_target_encoder(current_step, total_steps)
+        # Update target encoder (EMA) - use unwrapped model
+        trainer_module.update_target_encoder(current_step, total_steps)
 
         current_step += 1
 
@@ -158,11 +219,12 @@ def train_epoch_phase1(
         total_cov += outputs['jepa_covariance'].item()
         num_batches += 1
 
-        pbar.set_postfix({
-            'loss': f"{loss.item():.4f}",
-            'mse': f"{outputs['jepa_mse'].item():.4f}",
-            'var': f"{outputs['jepa_variance'].item():.4f}",
-        })
+        if is_main_process():
+            pbar.set_postfix({
+                'loss': f"{loss.item():.4f}",
+                'mse': f"{outputs['jepa_mse'].item():.4f}",
+                'var': f"{outputs['jepa_variance'].item():.4f}",
+            })
 
     avg_loss = total_loss / max(num_batches, 1)
     avg_mse = total_mse / max(num_batches, 1)
@@ -179,7 +241,7 @@ def train_epoch_phase1(
 
 
 def train_epoch_phase2(
-    trainer: StateVLATrainer,
+    trainer,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: str,
@@ -196,7 +258,7 @@ def train_epoch_phase2(
     num_batches = 0
     current_step = global_step
 
-    pbar = tqdm(dataloader, desc=f"[Phase 2] Epoch {epoch}")
+    pbar = tqdm(dataloader, desc=f"[Phase 2] Epoch {epoch}", disable=not is_main_process())
 
     for batch in pbar:
         # Move data to device
@@ -205,7 +267,9 @@ def train_epoch_phase2(
 
         # Forward pass
         optimizer.zero_grad()
-        outputs = trainer(
+
+        trainer_module = trainer.module if isinstance(trainer, DDP) else trainer
+        outputs = trainer_module(
             obs_dict=obs,
             gt_actions=actions,
         )
@@ -231,11 +295,12 @@ def train_epoch_phase2(
         total_gripper_loss += outputs['gripper_loss'].item()
         num_batches += 1
 
-        pbar.set_postfix({
-            'loss': f"{loss.item():.4f}",
-            'pos_rot': f"{outputs['pos_rot_loss'].item():.4f}",
-            'gripper': f"{outputs['gripper_loss'].item():.4f}",
-        })
+        if is_main_process():
+            pbar.set_postfix({
+                'loss': f"{loss.item():.4f}",
+                'pos_rot': f"{outputs['pos_rot_loss'].item():.4f}",
+                'gripper': f"{outputs['gripper_loss'].item():.4f}",
+            })
 
     avg_loss = total_loss / max(num_batches, 1)
     avg_pos_rot = total_pos_rot_loss / max(num_batches, 1)
@@ -267,6 +332,9 @@ def main():
                         help='Override batch size')
     args = parser.parse_args()
 
+    # Setup DDP (no-op if not launched via torchrun)
+    local_rank = setup_ddp()
+
     # Load config
     config = load_config(args.config)
 
@@ -279,23 +347,32 @@ def main():
         config['training']['batch_size'] = args.batch_size
 
     # Setup device
-    device = config.get('device', 'cuda')
-    if device == 'cuda' and not torch.cuda.is_available():
-        log.warning("CUDA not available, using CPU")
-        device = 'cpu'
+    if is_ddp():
+        device = f'cuda:{local_rank}'
+    else:
+        device = config.get('device', 'cuda')
+        if device == 'cuda' and not torch.cuda.is_available():
+            log.warning("CUDA not available, using CPU")
+            device = 'cpu'
 
-    # Set seed
-    set_seed(config.get('seed', 42))
+    # Set seed (offset by rank for different data per GPU)
+    set_seed(config.get('seed', 42) + get_rank())
 
     phase = args.phase
-    log.info(f"=== Phase {phase} Training ===")
-    log.info(f"Using device: {device}")
+    if is_main_process():
+        log.info(f"=== Phase {phase} Training ===")
+        log.info(f"Using device: {device}")
+        if is_ddp():
+            log.info(f"DDP: {get_world_size()} GPUs, batch_size per GPU = {config['training']['batch_size']}")
+            log.info(f"Effective batch size = {config['training']['batch_size'] * get_world_size()}")
 
     # Get phase-specific config
     phase_config = config['training'].get(f'phase{phase}', {})
 
     # Create dataset and dataloader
-    log.info("Loading dataset...")
+    if is_main_process():
+        log.info("Loading dataset...")
+
     dataloader, dataset = create_dataloader(
         data_directory=config['data']['data_directory'],
         batch_size=config['training']['batch_size'],
@@ -307,11 +384,34 @@ def main():
         camera_names=config['cameras']['names'],
     )
 
-    log.info(f"Dataset size: {len(dataset)}")
+    # Replace dataloader with DDP sampler if needed
+    if is_ddp():
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=get_world_size(),
+            rank=get_rank(),
+            shuffle=True,
+        )
+        dataloader = DataLoader(
+            dataset,
+            batch_size=config['training']['batch_size'],
+            sampler=sampler,
+            num_workers=dataloader.num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
+
+    if is_main_process():
+        log.info(f"Dataset size: {len(dataset)}")
 
     # Create model
-    log.info(f"Creating StateVLA model (Phase {phase})...")
+    if is_main_process():
+        log.info(f"Creating StateVLA model (Phase {phase})...")
     model_config = config['model']
+
+    # Create model on CPU first, then move to device
+    # (required for DDP: each rank must .to() its own GPU)
+    init_device = 'cpu' if is_ddp() else device
 
     model = StateVLA(
         # Tokenizer config
@@ -350,8 +450,8 @@ def main():
         temporal_hidden_dim=phase_config.get('temporal_predictor_hidden_dim', 512),
         # Training phase
         training_phase=phase,
-        # Device
-        device=device,
+        # Device: CPU for DDP init, actual device for single-GPU
+        device=init_device,
     )
 
     # Create training wrapper
@@ -380,22 +480,33 @@ def main():
         phase1_ckpt_path = args.phase1_checkpoint or phase_config.get('phase1_checkpoint')
         if phase1_ckpt_path is None:
             log.error("Phase 2 requires --phase1_checkpoint or phase2.phase1_checkpoint in config")
+            cleanup_ddp()
             return
 
-        log.info(f"Loading Phase 1 checkpoint: {phase1_ckpt_path}")
+        if is_main_process():
+            log.info(f"Loading Phase 1 checkpoint: {phase1_ckpt_path}")
         phase1_ckpt = torch.load(phase1_ckpt_path, map_location=device)
         trainer.load_state_dict(phase1_ckpt['model_state_dict'], strict=False)
-        log.info("Phase 1 encoder weights loaded successfully")
+        if is_main_process():
+            log.info("Phase 1 encoder weights loaded successfully")
 
         # Freeze encoder
         trainer.model.freeze_encoder()
-        log.info("Encoder frozen for Phase 2 training")
+        if is_main_process():
+            log.info("Encoder frozen for Phase 2 training")
 
     # Count parameters
     total_params = sum(p.numel() for p in trainer.parameters())
     trainable_params = sum(p.numel() for p in trainer.parameters() if p.requires_grad)
-    log.info(f"Total parameters: {total_params / 1e6:.2f}M")
-    log.info(f"Trainable parameters: {trainable_params / 1e6:.2f}M")
+    if is_main_process():
+        log.info(f"Total parameters: {total_params / 1e6:.2f}M")
+        log.info(f"Trainable parameters: {trainable_params / 1e6:.2f}M")
+
+    # Wrap with DDP
+    if is_ddp():
+        trainer = DDP(trainer, device_ids=[local_rank], find_unused_parameters=True)
+        if is_main_process():
+            log.info("Model wrapped with DDP")
 
     # Create optimizer (only for trainable parameters)
     lr = phase_config.get('learning_rate', training_config['learning_rate'])
@@ -420,17 +531,23 @@ def main():
     best_loss = float('inf')
 
     if args.checkpoint:
-        log.info(f"Resuming from checkpoint: {args.checkpoint}")
+        if is_main_process():
+            log.info(f"Resuming from checkpoint: {args.checkpoint}")
         checkpoint = torch.load(args.checkpoint, map_location=device)
-        trainer.load_state_dict(checkpoint['model_state_dict'], strict=False)
+
+        # Load into unwrapped model
+        model_to_load = trainer.module if isinstance(trainer, DDP) else trainer
+        model_to_load.load_state_dict(checkpoint['model_state_dict'], strict=False)
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
         best_loss = checkpoint.get('loss', float('inf'))
-        log.info(f"Resumed from epoch {start_epoch}")
+
+        if is_main_process():
+            log.info(f"Resumed from epoch {start_epoch}")
 
         # Re-freeze encoder if Phase 2
         if phase == 2:
-            trainer.model.freeze_encoder()
+            model_to_load.model.freeze_encoder()
 
     # Setup checkpoint directory
     checkpoint_dir = training_config.get('checkpoint_dir', 'checkpoints')
@@ -438,17 +555,23 @@ def main():
     checkpoint_dir = os.path.join(checkpoint_dir, f'phase{phase}_{timestamp}')
 
     # Training loop
-    log.info(f"Starting Phase {phase} training...")
+    if is_main_process():
+        log.info(f"Starting Phase {phase} training...")
     steps_per_epoch = len(dataloader)
     total_steps = num_epochs * steps_per_epoch
     global_step = start_epoch * steps_per_epoch
 
-    log.info(f"Epochs: {num_epochs}, Steps/epoch: {steps_per_epoch}, Total steps: {total_steps}")
+    if is_main_process():
+        log.info(f"Epochs: {num_epochs}, Steps/epoch: {steps_per_epoch}, Total steps: {total_steps}")
 
     # Select phase-specific training function
     train_fn = train_epoch_phase1 if phase == 1 else train_epoch_phase2
 
     for epoch in range(start_epoch, num_epochs):
+        # Set epoch for DDP sampler (ensures proper shuffling)
+        if is_ddp():
+            dataloader.sampler.set_epoch(epoch)
+
         # Train
         train_metrics = train_fn(
             trainer=trainer,
@@ -468,47 +591,55 @@ def main():
         if scheduler is not None:
             scheduler.step()
 
-        # Log metrics
+        # Log metrics (main process only)
+        if is_main_process():
+            if phase == 1:
+                log.info(
+                    f"Epoch {epoch}: loss={train_metrics['loss']:.4f}, "
+                    f"mse={train_metrics['jepa_mse']:.4f}, "
+                    f"var={train_metrics['jepa_variance']:.4f}, "
+                    f"cov={train_metrics['jepa_covariance']:.4f}"
+                )
+            else:
+                log.info(
+                    f"Epoch {epoch}: loss={train_metrics['loss']:.4f}, "
+                    f"pos_rot={train_metrics['pos_rot_loss']:.4f}, "
+                    f"gripper={train_metrics['gripper_loss']:.4f}"
+                )
+
+            # Save checkpoint (main process only)
+            is_best = train_metrics['loss'] < best_loss
+            if is_best:
+                best_loss = train_metrics['loss']
+
+            if (epoch + 1) % training_config.get('save_interval', 100) == 0 or is_best:
+                save_checkpoint(
+                    model=trainer,
+                    optimizer=optimizer,
+                    epoch=epoch,
+                    loss=train_metrics['loss'],
+                    config=config,
+                    checkpoint_dir=checkpoint_dir,
+                    is_best=is_best
+                )
+
+        # Synchronize all processes before next epoch
+        if is_ddp():
+            dist.barrier()
+
+    if is_main_process():
+        log.info(f"Phase {phase} training complete!")
+        log.info(f"Best loss: {best_loss:.4f}")
+        log.info(f"Checkpoints saved to: {checkpoint_dir}")
+
         if phase == 1:
             log.info(
-                f"Epoch {epoch}: loss={train_metrics['loss']:.4f}, "
-                f"mse={train_metrics['jepa_mse']:.4f}, "
-                f"var={train_metrics['jepa_variance']:.4f}, "
-                f"cov={train_metrics['jepa_covariance']:.4f}"
-            )
-        else:
-            log.info(
-                f"Epoch {epoch}: loss={train_metrics['loss']:.4f}, "
-                f"pos_rot={train_metrics['pos_rot_loss']:.4f}, "
-                f"gripper={train_metrics['gripper_loss']:.4f}"
+                f"\nNext step: Run Phase 2 with:\n"
+                f"  python train.py --config {args.config} --phase 2 "
+                f"--phase1_checkpoint {checkpoint_dir}/checkpoint_best.pt"
             )
 
-        # Save checkpoint
-        is_best = train_metrics['loss'] < best_loss
-        if is_best:
-            best_loss = train_metrics['loss']
-
-        if (epoch + 1) % training_config.get('save_interval', 100) == 0 or is_best:
-            save_checkpoint(
-                model=trainer,
-                optimizer=optimizer,
-                epoch=epoch,
-                loss=train_metrics['loss'],
-                config=config,
-                checkpoint_dir=checkpoint_dir,
-                is_best=is_best
-            )
-
-    log.info(f"Phase {phase} training complete!")
-    log.info(f"Best loss: {best_loss:.4f}")
-    log.info(f"Checkpoints saved to: {checkpoint_dir}")
-
-    if phase == 1:
-        log.info(
-            f"\nNext step: Run Phase 2 with:\n"
-            f"  python train.py --config {args.config} --phase 2 "
-            f"--phase1_checkpoint {checkpoint_dir}/checkpoint_best.pt"
-        )
+    cleanup_ddp()
 
 
 if __name__ == '__main__':
