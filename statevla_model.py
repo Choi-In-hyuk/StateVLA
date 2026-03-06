@@ -9,8 +9,8 @@ Phase 1 - Temporal JEPA (표현 학습):
 
 Phase 2 - Flow Matching (정책 학습):
   obs_t → FrozenEncoder → z_t
-  z_t → FlowMatchingPolicy → a_t
-  Loss: FlowMatching(velocity) + BCE(gripper)
+  z_t → FlowMatchingPolicy → a_t (7D unified: pos/rot + gripper)
+  Loss: FlowMatching MSE (all 7 dims)
 """
 
 import torch
@@ -121,9 +121,9 @@ class StateVLA(nn.Module):
             device=device,
         )
 
-        # Action normalization buffers (pos/rot only, 6 dims)
-        self.register_buffer("action_mean", torch.zeros(6))
-        self.register_buffer("action_std", torch.ones(6))
+        # Action normalization buffers (all 7 dims: pos/rot + gripper)
+        self.register_buffer("action_mean", torch.zeros(7))
+        self.register_buffer("action_std", torch.ones(7))
 
     def set_action_stats(self, mean: torch.Tensor, std: torch.Tensor):
         """Set action normalization statistics from dataset."""
@@ -131,10 +131,8 @@ class StateVLA(nn.Module):
         self.action_std.copy_(std)
 
     def denormalize_actions(self, actions: torch.Tensor) -> torch.Tensor:
-        """Denormalize pos/rot actions (gripper unchanged)."""
-        denormalized = actions.clone()
-        denormalized[..., :6] = actions[..., :6] * self.action_std + self.action_mean
-        return denormalized
+        """Denormalize all 7 action dimensions."""
+        return actions * self.action_std + self.action_mean
 
     def freeze_encoder(self):
         """Freeze state encoder for Phase 2 training."""
@@ -177,11 +175,11 @@ class StateVLA(nn.Module):
 
         Args:
             obs_dict: Current observation
-            gt_actions: [B, action_seq_len, action_dim] ground truth actions
+            gt_actions: [B, action_seq_len, action_dim] ground truth actions (7 dims)
             sigma: [B] diffusion timestep
 
         Returns:
-            Dictionary with z_t, velocity, noise, gripper_logits, gripper_targets
+            Dictionary with z_t, velocity, noise
         """
         batch_size = gt_actions.shape[0]
 
@@ -189,37 +187,22 @@ class StateVLA(nn.Module):
         with torch.no_grad():
             state_outputs = self.state_encoder(obs_dict)
         z_t = state_outputs["z_t"]
+        patch_features = state_outputs.get("patch_features")  # [B, 392, embed_dim]
 
-        outputs = {"z_t": z_t}
-
-        # Split actions: pos/rot (6 dims) and gripper (1 dim)
-        pos_rot_actions = gt_actions[:, :, :6]
-        gripper_actions = gt_actions[:, :, 6]
-
-        # Sample noise for flow matching (pos/rot only)
-        noise = torch.randn_like(pos_rot_actions)
+        # Sample noise for flow matching (all 7 dims)
+        noise = torch.randn_like(gt_actions)
         sigma_expanded = sigma.view(batch_size, 1, 1)
-        noisy_pos_rot = (1 - sigma_expanded) * pos_rot_actions + sigma_expanded * noise
+        noisy_actions = (1 - sigma_expanded) * gt_actions + sigma_expanded * noise
 
-        # Create full noisy actions with dummy gripper
-        dummy_gripper = torch.zeros(
-            batch_size, gt_actions.shape[1], 1, device=z_t.device
-        )
-        noisy_actions = torch.cat([noisy_pos_rot, dummy_gripper], dim=-1)
-
-        # Predict velocity and gripper logits
+        # Predict velocity for all 7 dims
         error = torch.zeros_like(z_t)
+        velocity = self.action_policy(z_t, z_t, error, noisy_actions, sigma, spatial_features=patch_features)
 
-        velocity, gripper_logits = self.action_policy(
-            z_t, z_t, error, noisy_actions, sigma
-        )
-
-        outputs["velocity"] = velocity
-        outputs["noise"] = noise
-        outputs["gripper_logits"] = gripper_logits
-        outputs["gripper_targets"] = gripper_actions
-
-        return outputs
+        return {
+            "z_t": z_t,
+            "velocity": velocity,
+            "noise": noise,
+        }
 
     def forward(
         self,
@@ -253,6 +236,7 @@ class StateVLA(nn.Module):
         self,
         obs_dict: Dict[str, torch.Tensor],
         sample_steps: int = 4,
+        use_spatial_features: bool = True,
     ) -> torch.Tensor:
         """
         Generate actions at inference time.
@@ -266,14 +250,18 @@ class StateVLA(nn.Module):
         """
         self.eval()
 
-        # Encode state
-        z_t = self.state_encoder.encode(obs_dict)
+        # Encode state (z_t + spatial patch features)
+        if use_spatial_features:
+            z_t, patch_features = self.state_encoder.encode_full(obs_dict)
+        else:
+            z_t = self.state_encoder.encode(obs_dict)
+            patch_features = None
 
-        # Generate actions from z_t
+        # Generate actions from z_t + spatial features
         error = torch.zeros_like(z_t)
 
         actions = self.action_policy.generate_actions(
-            z_t, z_t, error, sample_steps
+            z_t, z_t, error, sample_steps, spatial_features=patch_features
         )
 
         # Denormalize pos/rot actions
@@ -324,6 +312,7 @@ class StateVLATrainer(nn.Module):
         covariance_weight: float = 0.04,
         ema_momentum: float = 0.996,
         ema_momentum_schedule: str = "cosine",
+        world_model_loss_weight: float = 0.1,
     ):
         super().__init__()
         self.model = model
@@ -333,40 +322,28 @@ class StateVLATrainer(nn.Module):
         self.covariance_weight = covariance_weight
         self.ema_momentum = ema_momentum
         self.ema_momentum_schedule = ema_momentum_schedule
+        self.world_model_loss_weight = world_model_loss_weight
 
     def compute_action_loss(
         self,
         velocity_pred: torch.Tensor,
         noise: torch.Tensor,
-        pos_rot_actions: torch.Tensor,
-        gripper_logits: torch.Tensor,
-        gripper_targets: torch.Tensor,
+        actions: torch.Tensor,
     ) -> tuple:
         """
-        Compute Flow Matching loss for pos/rot and BCE loss for gripper.
+        Compute unified Flow Matching loss for all 7 action dims.
 
         Args:
-            velocity_pred: [B, seq_len, 6] predicted velocity
-            noise: [B, seq_len, 6] sampled noise
-            pos_rot_actions: [B, seq_len, 6] ground truth pos/rot
-            gripper_logits: [B, seq_len] gripper prediction logits
-            gripper_targets: [B, seq_len] ground truth gripper (-1 or 1)
+            velocity_pred: [B, seq_len, 7] predicted velocity
+            noise: [B, seq_len, 7] sampled noise
+            actions: [B, seq_len, 7] ground truth actions
 
         Returns:
-            total_loss, pos_rot_loss, gripper_loss
+            total_loss, flow_loss, zero (placeholder for gripper_loss)
         """
-        # Position/Rotation Flow Matching loss
-        target_velocity = noise - pos_rot_actions
-        pos_rot_loss = F.mse_loss(velocity_pred, target_velocity)
-
-        # Gripper BCE loss (convert from {-1, 1} to {0, 1})
-        gripper_binary = (gripper_targets > 0).float()
-        gripper_loss = F.binary_cross_entropy_with_logits(
-            gripper_logits, gripper_binary
-        )
-
-        total_loss = pos_rot_loss + gripper_loss
-        return total_loss, pos_rot_loss, gripper_loss
+        target_velocity = noise - actions
+        flow_loss = F.mse_loss(velocity_pred, target_velocity)
+        return flow_loss, flow_loss, torch.tensor(0.0, device=flow_loss.device)
 
     def forward_phase1(
         self,
@@ -417,13 +394,20 @@ class StateVLATrainer(nn.Module):
         self,
         obs_dict: Dict[str, torch.Tensor],
         gt_actions: torch.Tensor,
+        next_obs_dict: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Phase 2 training: Flow Matching action loss.
+        Phase 2 training: Flow Matching action loss (all 7 dims).
+
+        Optionally adds World Model Consistency Loss:
+          - 예측한 clean action â_t를 temporal predictor에 넣어 ẑ_{t+1} 예측
+          - 실제 z_{t+1} (target encoder)과 비교 → policy가 물리적으로 타당한 action 생성하도록 유도
+          - Gradient: L_world → z_next_pred → temporal_predictor(z_t, â_t) → â_t → velocity → policy
 
         Args:
             obs_dict: Current observation
-            gt_actions: [B, action_seq_len, action_dim] ground truth actions
+            gt_actions: [B, action_seq_len, action_dim] ground truth actions (7 dims)
+            next_obs_dict: Next observation (optional, required for world model loss)
 
         Returns:
             Dictionary with losses
@@ -436,16 +420,42 @@ class StateVLATrainer(nn.Module):
 
         outputs = self.model.forward_phase2(obs_dict, gt_actions, sigma)
 
-        # Action loss
+        # Unified 7D flow matching loss
         action_loss, pos_rot_loss, gripper_loss = self.compute_action_loss(
             outputs["velocity"],
             outputs["noise"],
-            gt_actions[:, :, :6],
-            outputs["gripper_logits"],
-            outputs["gripper_targets"],
+            gt_actions,
         )
 
         total_loss = self.action_loss_weight * action_loss
+
+        # World Model Consistency Loss
+        # Phase 1에서 학습한 temporal predictor 재활용:
+        #   "이 action을 하면 다음 상태가 이렇게 될 것이다"를 Phase 2 policy 학습에 활용
+        world_model_loss = torch.tensor(0.0, device=device)
+        if next_obs_dict is not None and self.world_model_loss_weight > 0:
+            # Flow matching 예측에서 clean action 추정:
+            # noisy_a = (1-σ)*gt_a + σ*noise, velocity = noise - gt_a
+            # → x_0_pred = noisy_a - σ * v_pred  (predicted clean action)
+            sigma_expanded = sigma.view(batch_size, 1, 1)
+            noisy_actions = (1 - sigma_expanded) * gt_actions + sigma_expanded * outputs["noise"]
+            x_0_pred = noisy_actions - sigma_expanded * outputs["velocity"]  # [B, T, 7]
+            a_t_pred = x_0_pred[:, 0, :]  # 첫 번째 action을 a_t로 사용 [B, 7]
+
+            # World model forward: TemporalPredictor(z_t, â_t) → ẑ_{t+1}
+            # - z_t: no_grad (frozen encoder에서 생성됨)
+            # - temporal_predictor params: no_grad (frozen encoder의 일부)
+            # → gradient는 오직 a_t_pred → velocity → policy로만 흐름 ✓
+            state_encoder = self.model.state_encoder
+            z_t = outputs["z_t"]
+            z_next_pred = state_encoder.temporal_predictor(z_t, a_t_pred)
+
+            # 실제 z_{t+1}: target encoder로 계산 (no gradient)
+            with torch.no_grad():
+                z_next_target = state_encoder._encode_obs(next_obs_dict, use_target=True)["z"]
+
+            world_model_loss = F.mse_loss(z_next_pred, z_next_target.detach())
+            total_loss = total_loss + self.world_model_loss_weight * world_model_loss
 
         return {
             "loss": total_loss,
@@ -456,6 +466,7 @@ class StateVLATrainer(nn.Module):
             "action_loss": action_loss,
             "pos_rot_loss": pos_rot_loss,
             "gripper_loss": gripper_loss,
+            "world_model_loss": world_model_loss,
             "z_t": outputs["z_t"],
         }
 
@@ -480,7 +491,7 @@ class StateVLATrainer(nn.Module):
                 obs_dict, next_obs_dict, action, step, total_steps
             )
         else:
-            return self.forward_phase2(obs_dict, gt_actions)
+            return self.forward_phase2(obs_dict, gt_actions, next_obs_dict)
 
     def update_target_encoder(self, step: int, total_steps: int):
         """Update target encoder with scheduled momentum."""

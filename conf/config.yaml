@@ -2,10 +2,10 @@
 
 # ============= Data Configuration =============
 data:
-  data_directory: "/home/choi/choi_ws/openvla/datasets/libero_object"
+  data_directory: "/home/choi/libero_object_temp"
+  language_embedding_path: "/home/choi/StateVLA/data/libero/language_embeddings/libero_object.pkl"
   demos_per_task: 50
   max_len_data: 260
-  train_split: 0.9
 
 # ============= Model Configuration =============
 model:
@@ -64,6 +64,7 @@ training:
   # Loss Weights
   jepa_loss_weight: 1.0
   action_loss_weight: 1.0
+  world_model_loss_weight: 0.0  # Phase 2: world model consistency (temporal predictor 재활용)
 
   # VICReg Regularization Weights
   variance_weight: 1.0
@@ -73,16 +74,15 @@ training:
   ema_momentum: 0.996
   ema_momentum_schedule: "cosine"
 
-  use_lr_scheduler: false
-  min_lr: 1.0e-6
+  use_lr_scheduler: true
+  min_lr: 5.0e-6
 
   # Flow Matching
   sampling_steps: 4
 
   # Checkpointing
-  save_interval: 100
+  save_interval: 200
   checkpoint_dir: "checkpoints"
-  log_interval: 10
 
   # ---- Phase 1: Temporal JEPA ----
   phase1:
@@ -92,8 +92,9 @@ training:
 
   # ---- Phase 2: Flow Matching ----
   phase2:
-    num_epochs: 1000
+    num_epochs: 3000
     learning_rate: 5.0e-5
+    scheduler_epochs: 1000   # CosineAnnealingLR T_max (num_epochs와 별개)
     phase1_checkpoint: null
 
 # ============= Camera & Device =============

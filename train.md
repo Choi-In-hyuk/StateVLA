@@ -45,7 +45,7 @@
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### Phase 2: Flow Matching (정책 학습)
+### Phase 2: Flow Matching + World Model Consistency (정책 학습)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -66,17 +66,19 @@
 │          │  Mamba backbone │      │ {-1,1} → {0,1}   │             │
 │          │     ↓           │      └────────┬─────────┘             │
 │          │  velocity (6D)  │               │                        │
-│          │                 │               │                        │
 │          │  Loss: MSE      │               │                        │
-│          │  (v, noise-x_0) │               │                        │
 │          └────────┬────────┘               │                        │
-│                   │                        │                        │
 │                   └──────┬─────────────────┘                        │
 │                          ↓                                          │
 │                [pos_rot(6), gripper(1)] × 10 steps                  │
 │                                                                     │
+│  [추가] World Model Consistency Loss (weight=0.1):                  │
+│    â_t = x_noisy - σ · v_pred  (예측된 clean action)               │
+│    L_wm = MSE(TP(z_t, â_t), z_{t+1})                               │
+│    → 물리적으로 타당한 action만 생성하도록 regularization           │
+│                                                                     │
 │  Trainable: Flow Matching Policy + Gripper Classifier               │
-│  Frozen:    Encoder (from Phase 1)                                  │
+│  Frozen:    Encoder + Temporal Predictor (from Phase 1)             │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -86,15 +88,15 @@
 
 | Component | Model | Params | Description |
 |-----------|-------|--------|-------------|
-| Image Tokenizer | Conv2d (16×16 patches) | ~0.6M | 224×224 → 196 patches × 256D (per camera) |
-| Language Tokenizer | Linear (512 → 256) | ~131K | Pre-computed embedding → 1 token |
+| Image Tokenizer | SigLIP ViT-B/16 (frozen) | ~86M | 224×224 → 196 patches × 256D (per camera) |
+| Language Tokenizer | CLIP ViT-B/32 (frozen) | ~87M | Pre-computed embedding → 1 token × 256D |
 | Robot State Tokenizer | MLP (9 → 256) | ~68K | joint(7) + gripper(2) → 1 token |
 | Context Encoder | Mamba SSM × 12 layers | ~12.3M | d_model=256, d_state=16, d_conv=4 |
 | Target Encoder | EMA copy | shared | No gradient, momentum update |
 | Temporal Predictor | MLP (1024 → 512 → 512 → 256) | ~1.1M | Residual: z_{t+1} = z_t + delta |
 | Flow Matching Policy | Mamba SSM × 3 layers | ~1.8M | d_model=256, denoising |
 | Gripper Classifier | MLP (256 → 256 → 10) | ~132K | Binary per timestep |
-| **Total** | | **~14.9M** | |
+| **Total Trainable** | | **~14.9M** | |
 
 ---
 
@@ -102,10 +104,11 @@
 
 ### LIBERO-Object Dataset
 
-- **Location**: `/path/to/libero_object/`
+- **Location**: `/home/choi/libero_object_temp/`
+- **Language Embeddings**: `/home/choi/StateVLA/data/libero/language_embeddings/libero_object.pkl`
 - **Tasks**: 10 pick-and-place tasks
 - **Demos**: 50 per task (500 total)
-- **Total samples**: ~70,000
+- **Training**: 전체 데이터 사용 (val split 없음)
 
 ### Observation (Encoder Input)
 
@@ -115,6 +118,7 @@
 | `eye_in_hand_rgb` | [T, 224, 224, 3] | Wrist camera |
 | `joint_states` | [T, 7] | Joint positions |
 | `gripper_states` | [T, 2] | Left/right finger positions (continuous) |
+| `lang_emb` | [1, 512] | Pre-computed CLIP task embedding |
 
 → `robot_state = concat(joint_states, gripper_states)` → **9D**
 
@@ -131,11 +135,21 @@
 
 ### Phase 1: Temporal JEPA
 
+Single GPU:
 ```bash
-python train.py --config conf/config.yaml --phase 1
+python /home/choi/StateVLA/train.py \
+  --config /home/choi/StateVLA/conf/config.yaml \
+  --phase 1
 ```
 
-**What it learns**: 현재 상태 z_t에서 action a_t를 수행하면 다음 상태 z_{t+1}이 어떻게 되는지 예측
+Multi-GPU (DDP, 2x GPU, batch 128/GPU = effective 256):
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 /home/choi/StateVLA/train.py \
+  --config /home/choi/StateVLA/conf/config.yaml \
+  --phase 1 \
+  --batch_size 128 \
+  2>&1 | tee /home/choi/StateVLA/phase1_train_ddp.log
+```
 
 **Monitoring**:
 - `jepa_mse`: 예측 정확도 (낮을수록 좋음)
@@ -147,54 +161,60 @@ python train.py --config conf/config.yaml --phase 1
 ### Phase 2: Flow Matching
 
 ```bash
-python train.py --config conf/config.yaml --phase 2 \
-    --phase1_checkpoint checkpoints/phase1_temporal_jepa/checkpoint_best.pt
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 /home/choi/StateVLA/train.py \
+  --config /home/choi/StateVLA/conf/config.yaml \
+  --phase 2 \
+  --batch_size 128 \
+  --phase1_checkpoint checkpoints/phase1_XXXXXXXX_XXXXXX/checkpoint_best.pt \
+  2>&1 | tee /home/choi/StateVLA/phase2_train_ddp.log
 ```
-
-**What it learns**: 부드러운 연속 action 생성 (encoder는 frozen)
 
 **Monitoring**:
 - `pos_rot_loss`: position/rotation Flow Matching loss
 - `gripper_loss`: gripper BCE loss
-- `action_loss`: total = pos_rot + gripper
+- `wm`: world model consistency loss (물리적 타당성 regularization)
 
 ### Resume Training
 
 ```bash
 # Phase 1 resume
-python train.py --config conf/config.yaml --phase 1 \
-    --checkpoint checkpoints/phase1_temporal_jepa/checkpoint_latest.pt
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 /home/choi/StateVLA/train.py \
+  --config /home/choi/StateVLA/conf/config.yaml \
+  --phase 1 \
+  --batch_size 128 \
+  --checkpoint checkpoints/phase1_XXXXXXXX_XXXXXX/checkpoint_latest.pt \
+  2>&1 | tee /home/choi/StateVLA/phase1_resume_ddp.log
 
 # Phase 2 resume
-python train.py --config conf/config.yaml --phase 2 \
-    --checkpoint checkpoints/phase2_flow_matching/checkpoint_latest.pt
-```
-
-### Multi-GPU (DDP)
-
-```bash
-torchrun --nproc_per_node=2 train.py --config conf/config.yaml --phase 1
-torchrun --nproc_per_node=4 train.py --config conf/config.yaml --phase 1
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 /home/choi/StateVLA/train.py \
+  --config /home/choi/StateVLA/conf/config.yaml \
+  --phase 2 \
+  --batch_size 128 \
+  --phase1_checkpoint checkpoints/phase1_XXXXXXXX_XXXXXX/checkpoint_best.pt \
+  --checkpoint checkpoints/phase2_XXXXXXXX_XXXXXX/checkpoint_latest.pt \
+  2>&1 | tee /home/choi/StateVLA/phase2_resume_ddp.log
 ```
 
 ---
 
-## Configuration
-
-### `conf/config.yaml`
+## Configuration (`conf/config.yaml`)
 
 ```yaml
 data:
-  data_directory: "/path/to/libero_object"
+  data_directory: "/home/choi/libero_object_temp"
+  language_embedding_path: "/home/choi/StateVLA/data/libero/language_embeddings/libero_object.pkl"
   demos_per_task: 50
   max_len_data: 260
-  train_split: 0.9
 
 model:
   image_size: 224
   patch_size: 16                # 14×14 = 196 patches per image
   embed_dim: 256                # Token embedding dimension
-  lang_emb_dim: 512             # Language embedding input dim
+  use_pretrained_vision: true   # SigLIP backbone (frozen)
+  use_pretrained_language: true # CLIP backbone (frozen)
+  vision_model_name: "google/siglip-base-patch16-224"
+  language_model_name: "ViT-B/32"
+  lang_emb_dim: 512             # Language embedding input dim (CLIP output)
   robot_state_dim: 9            # joint(7) + gripper(2)
   encoder_depth: 12             # Mamba encoder layers
   d_state: 16                   # Mamba state dimension
@@ -207,14 +227,16 @@ model:
   policy_embed_dim: 256         # Flow Matching hidden dim
 
 training:
-  batch_size: 64
+  batch_size: 256               # Per-GPU: 128 (DDP 2GPU → effective 256)
   learning_rate: 1.0e-4
   weight_decay: 0.05
   gradient_clip: 1.0
   ema_momentum: 0.996
   ema_momentum_schedule: "cosine"
-  save_interval: 100
-  log_interval: 10
+  world_model_loss_weight: 0.1  # Phase 2 world model consistency
+  use_lr_scheduler: true        # CosineAnnealingLR
+  min_lr: 5.0e-6
+  save_interval: 200            # epoch checkpoint 저장 간격
 
   phase1:
     num_epochs: 1000
@@ -222,7 +244,7 @@ training:
     temporal_predictor_hidden_dim: 512
 
   phase2:
-    num_epochs: 1000
+    num_epochs: 3000
     learning_rate: 5.0e-5
 ```
 
@@ -230,8 +252,8 @@ training:
 
 ## GPU Memory Guide
 
-| Batch Size | GPU Memory (approx) |
-|------------|---------------------|
+| Batch Size (per GPU) | GPU Memory (approx) |
+|----------------------|---------------------|
 | 256 | ~40GB |
 | 128 | ~24GB |
 | 64 | ~16GB |
@@ -241,24 +263,25 @@ training:
 
 ## Checkpoints
 
-저장 위치: `checkpoints/phase{1,2}_{name}/`
+저장 위치: `checkpoints/phase{1,2}_{timestamp}/`
 
 | File | Description |
 |------|-------------|
-| `checkpoint_latest.pt` | 최신 체크포인트 |
-| `checkpoint_best.pt` | 최저 loss 체크포인트 |
-| `checkpoint_epoch_N.pt` | N 에포크 체크포인트 (save_interval마다) |
+| `checkpoint_latest.pt` | 매 epoch 덮어씌우는 최신 체크포인트 |
+| `checkpoint_best.pt` | train_loss 기준 최저 체크포인트 |
+| `checkpoint_epoch_N.pt` | N epoch 체크포인트 (save_interval=200마다) |
 
 ### Checkpoint Structure
 
 ```python
 {
     'epoch': int,
-    'model_state_dict': dict,     # StateVLATrainer state
+    'model_state_dict': dict,       # StateVLATrainer state
     'optimizer_state_dict': dict,
-    'loss': float,
+    'scheduler_state_dict': dict,   # CosineAnnealingLR state (resume 시 LR 복원)
+    'loss': float,                  # 해당 epoch train loss
+    'best_train_loss': float,       # 지금까지 최저 train loss (best 판단 기준)
     'config': dict,
-    'phase': int,                 # 1 or 2
 }
 ```
 
@@ -266,19 +289,11 @@ training:
 
 ## Evaluation
 
-### Offline (MSE)
-
-```bash
-python eval.py --checkpoint checkpoints/phase2_flow_matching/checkpoint_best.pt
-```
-
-출력: per-dimension MSE (x, y, z, rx, ry, rz, gripper)
-
 ### LIBERO Simulation
 
 ```bash
 python run_libero_eval.py \
-    --checkpoint checkpoints/phase2_flow_matching/checkpoint_best.pt \
+    --checkpoint checkpoints/phase2_XXXXXXXX_XXXXXX/checkpoint_best.pt \
     --task_suite libero_object \
     --num_trials 50
 ```
@@ -290,7 +305,9 @@ python run_libero_eval.py \
 ### Out of Memory
 
 ```bash
-python train.py --config conf/config.yaml --phase 1 --batch_size 32
+# DDP: batch_size를 GPU당 64로 줄이기
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train.py \
+  --config conf/config.yaml --phase 1 --batch_size 64
 ```
 
 ### Mamba-SSM Build Error
@@ -308,7 +325,7 @@ pip install mamba-ssm --no-build-isolation
 ### Phase 2 Loss Not Decreasing
 
 - Phase 1 체크포인트가 제대로 로드되었는지 확인
-- Encoder가 frozen인지 확인 (학습 로그에 parameter count)
+- Encoder가 frozen인지 확인 (학습 로그에 trainable parameter count)
 
 ---
 
@@ -316,13 +333,12 @@ pip install mamba-ssm --no-build-isolation
 
 | File | Description |
 |------|-------------|
-| `train.py` | Training script (`--phase 1` / `--phase 2`) |
-| `eval.py` | Offline evaluation (MSE) |
+| `train.py` | Training script (`--phase 1` / `--phase 2`), DDP 지원 |
 | `run_libero_eval.py` | LIBERO simulation evaluation |
 | `statevla_model.py` | StateVLA + StateVLATrainer (two-phase routing) |
 | `state_encoder.py` | JEPAStateEncoder (tokenizer + encoder + temporal predictor) |
 | `action_policy.py` | FlowMatchingPolicy + GripperClassifier |
-| `jepa/tokenizer.py` | Multi-modal tokenizer (Lang → Robot → Vision → CLS) |
+| `jepa/tokenizer.py` | Multi-modal tokenizer (SigLIP + CLIP + Robot → Mamba) |
 | `jepa/encoder.py` | Context Encoder (Mamba) + Target Encoder (EMA) |
 | `jepa/temporal_predictor.py` | z_t + a_t → z'_{t+1} + VICReg loss |
 | `dataloader.py` | Dataset loading + action normalization (pos/rot only) |

@@ -91,9 +91,6 @@ def get_libero_env(task, resolution=256):
 
 def preprocess_image(img, target_size=224):
     """Preprocess image from LIBERO environment."""
-    # Rotate 180 degrees (LIBERO convention)
-    img = img[::-1, ::-1].copy()
-
     # Resize if needed
     if img.shape[0] != target_size or img.shape[1] != target_size:
         from PIL import Image
@@ -116,7 +113,7 @@ def prepare_observation(obs, device, image_size=224):
     Returns:
         obs_dict: Dictionary ready for model input
     """
-    # Get and preprocess images
+    # Get and preprocess images (no rotation - matches training data convention)
     agentview = preprocess_image(obs["agentview_image"], image_size)
     eye_in_hand = preprocess_image(obs["robot0_eye_in_hand_image"], image_size)
 
@@ -124,16 +121,11 @@ def prepare_observation(obs, device, image_size=224):
     agentview_tensor = torch.from_numpy(agentview).permute(2, 0, 1).float() / 255.0
     eye_in_hand_tensor = torch.from_numpy(eye_in_hand).permute(2, 0, 1).float() / 255.0
 
-    # Get robot state
-    eef_pos = obs["robot0_eef_pos"]  # [3]
-    eef_quat = obs["robot0_eef_quat"]  # [4]
-    eef_axisangle = quat2axisangle(eef_quat.copy())  # [3]
+    # Get robot state: joint_states(7) + gripper_states(2) = 9D
+    # Matches training data format from HDF5
+    joint_states = obs["robot0_joint_pos"]   # [7]
     gripper_qpos = obs["robot0_gripper_qpos"]  # [2]
-
-    # Combine robot state: [pos(3) + axisangle(3) + gripper(2)] = 8
-    # But our model expects 9-dim (joint_states:7 + gripper:2)
-    # We'll use: [eef_pos(3) + eef_axisangle(3) + gripper(2) + padding(1)]
-    robot_state = np.concatenate([eef_pos, eef_axisangle, gripper_qpos, [0.0]])
+    robot_state = np.concatenate([joint_states, gripper_qpos])  # [9]
     robot_state_tensor = torch.from_numpy(robot_state).float()
 
     # Build observation dict
@@ -146,13 +138,10 @@ def prepare_observation(obs, device, image_size=224):
     return obs_dict, agentview  # Return original image for video
 
 
-def normalize_gripper_action(action, binarize=True):
-    """Normalize gripper action from [0, 1] to [-1, 1]."""
+def binarize_gripper_action(action):
+    """Binarize gripper action from continuous to {-1, 1}."""
     action = action.copy()
-    if binarize:
-        action[-1] = 1.0 if action[-1] > 0.5 else -1.0
-    else:
-        action[-1] = action[-1] * 2.0 - 1.0
+    action[-1] = 1.0 if action[-1] > 0.0 else -1.0
     return action
 
 
@@ -178,7 +167,7 @@ class LanguageEncoder:
 
     def __init__(self, task_suite: str, device="cuda"):
         self.device = device
-        self.embed_dim = 3584
+        self.embed_dim = 512  # CLIP ViT-B/32 embedding dim (matches training config)
 
         # Load pre-computed embeddings
         emb_path = os.path.join(
@@ -206,9 +195,10 @@ class LanguageEncoder:
         if key in self.embeddings:
             emb = self.embeddings[key]
             if isinstance(emb, torch.Tensor):
-                return emb.unsqueeze(0).to(self.device)
+                # pkl stores [1, 512] tensors - use as-is (already has batch dim)
+                return emb.to(self.device)
             else:
-                return torch.from_numpy(emb).unsqueeze(0).float().to(self.device)
+                return torch.from_numpy(emb).float().to(self.device)
         else:
             log.warning(f"Embedding not found for: {key}")
             return torch.zeros(1, self.embed_dim, device=self.device)
@@ -226,6 +216,7 @@ def run_episode(
     action_chunk_size=10,
     sample_steps=4,
     image_size=224,
+    use_spatial_features=True,
 ):
     """
     Run a single episode in the environment.
@@ -277,7 +268,8 @@ def run_episode(
             if len(action_queue) == 0:
                 with torch.no_grad():
                     # Get action sequence from model
-                    actions = model.predict(obs_dict, sample_steps=sample_steps)
+                    actions = model.predict(obs_dict, sample_steps=sample_steps,
+                                            use_spatial_features=use_spatial_features)
                     actions = actions[0].cpu().numpy()  # [seq_len, action_dim]
 
                 # Add actions to queue
@@ -287,8 +279,8 @@ def run_episode(
             # Get next action
             action = action_queue.popleft()
 
-            # Process action
-            action = normalize_gripper_action(action, binarize=True)
+            # Binarize gripper: continuous flow matching output → {-1, 1}
+            action = binarize_gripper_action(action)
 
             # Execute action
             obs, reward, done, info = env.step(action.tolist())
@@ -392,12 +384,14 @@ def main():
                         help="Save rollout videos")
     parser.add_argument("--video_dir", type=str, default="rollouts",
                         help="Directory to save videos")
-    parser.add_argument("--action_chunk_size", type=int, default=10,
+    parser.add_argument("--action_chunk_size", type=int, default=5,
                         help="Number of actions to execute before re-querying")
     parser.add_argument("--sample_steps", type=int, default=4,
                         help="Denoising steps for action generation")
     parser.add_argument("--env_resolution", type=int, default=256,
                         help="Environment image resolution")
+    parser.add_argument("--no_spatial_features", action="store_true",
+                        help="Disable spatial patch cross-attention (use for old checkpoints)")
     args = parser.parse_args()
 
     # Set seed
@@ -481,6 +475,7 @@ def main():
                 action_chunk_size=args.action_chunk_size,
                 sample_steps=args.sample_steps,
                 image_size=image_size,
+                use_spatial_features=not args.no_spatial_features,
             )
 
             task_episodes += 1

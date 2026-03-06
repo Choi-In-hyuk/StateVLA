@@ -118,7 +118,7 @@ class JEPAStateEncoder(nn.Module):
         self,
         obs_dict: Dict[str, torch.Tensor],
         use_target: bool = False,
-    ) -> torch.Tensor:
+    ) -> Dict[str, torch.Tensor]:
         """
         Encode observation to state representation z.
 
@@ -127,20 +127,27 @@ class JEPAStateEncoder(nn.Module):
             use_target: If True, use target encoder (for z_{t+1} target)
 
         Returns:
-            z: [B, state_dim] state representation
+            dict with:
+              'z': [B, state_dim] state representation (CLS)
+              'patch_features': [B, 392, embed_dim] image patch tokens (context only)
         """
         tokens, _ = self.tokenizer(obs_dict)
 
         if use_target:
             with torch.no_grad():
-                features = self.target_encoder(tokens)  # [B, N, D]
-                cls_output = features[:, -1]  # CLS token (last position)
+                all_features = self.target_encoder(tokens)  # [B, N, D]
+                cls_output = all_features[:, -1]  # CLS token (last position)
+            z = self.state_proj(cls_output)
+            return {'z': z}
         else:
             # No masking - process all tokens
-            _, cls_output = self.context_encoder(tokens, mask=None)
-
-        z = self.state_proj(cls_output)
-        return z
+            features, cls_output = self.context_encoder(tokens, mask=None)
+            z = self.state_proj(cls_output)
+            # Token order: [Lang(1)] [Robot(1)] [AgentView(196)] [EyeInHand(196)] [CLS]
+            # features = hidden[:, :-1] = [B, 394, embed_dim]
+            # Image patches start at index 2 (skip lang, robot)
+            patch_features = features[:, 2:]  # [B, 392, embed_dim]
+            return {'z': z, 'patch_features': patch_features}
 
     def forward_temporal(
         self,
@@ -165,10 +172,12 @@ class JEPAStateEncoder(nn.Module):
                 - 'z_next_target': [B, state_dim] target next state (detached)
         """
         # Encode current observation → z_t
-        z_t = self._encode_obs(obs_dict, use_target=False)
+        result_t = self._encode_obs(obs_dict, use_target=False)
+        z_t = result_t['z']
 
         # Encode next observation → z_{t+1} (target, no gradient)
-        z_next_target = self._encode_obs(next_obs_dict, use_target=True)
+        result_next = self._encode_obs(next_obs_dict, use_target=True)
+        z_next_target = result_next['z']
 
         # Predict next state: z_t + a_t → z'_{t+1}
         z_next_pred = self.temporal_predictor(z_t, action)
@@ -196,23 +205,27 @@ class JEPAStateEncoder(nn.Module):
             Dictionary containing:
                 - 'z_t': [B, state_dim] state representation
         """
-        z_t = self._encode_obs(obs_dict, use_target=False)
-        return {'z_t': z_t}
+        result = self._encode_obs(obs_dict, use_target=False)
+        return {'z_t': result['z'], 'patch_features': result['patch_features']}
 
     @torch.no_grad()
     def encode(self, obs_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """
-        Inference-only encoding.
+        """Inference-only encoding (CLS only)."""
+        self.eval()
+        result = self._encode_obs(obs_dict, use_target=False)
+        return result['z']
 
-        Args:
-            obs_dict: Observation dictionary
+    @torch.no_grad()
+    def encode_full(self, obs_dict: Dict[str, torch.Tensor]):
+        """Inference-only encoding returning CLS + patch features.
 
         Returns:
-            z_t: [B, state_dim] state representation
+            z_t: [B, state_dim]
+            patch_features: [B, 392, embed_dim]
         """
         self.eval()
-        z_t = self._encode_obs(obs_dict, use_target=False)
-        return z_t
+        result = self._encode_obs(obs_dict, use_target=False)
+        return result['z'], result['patch_features']
 
     @torch.no_grad()
     def update_target_encoder(self, momentum: float = 0.996):

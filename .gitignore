@@ -62,6 +62,9 @@ huggingface/
 
 # Logs and Outputs
 logs/
+eval_logs/
+eval_results/
+eval_videos/
 wandb/
 outputs/
 *.log

@@ -271,7 +271,7 @@ obs_t ──→ Frozen Encoder ──→ z_t (256D, no gradient)
 
 ### Loss Function (Phase 2)
 
-$$\mathcal{L}_{\text{phase2}} = \mathcal{L}_{\text{flow}} + \mathcal{L}_{\text{gripper}}$$
+$$\mathcal{L}_{\text{phase2}} = \mathcal{L}_{\text{flow}} + \mathcal{L}_{\text{gripper}} + \lambda_{wm} \cdot \mathcal{L}_{\text{world}}$$
 
 ---
 
@@ -348,6 +348,31 @@ gripper_loss = F.binary_cross_entropy_with_logits(
 - Gripper는 이산 값 {open, close} → 연속 denoising과 맞지 않음
 - Flow Matching은 연속 공간에서 smooth trajectory를 만드는 데 최적화 → 이산 binary action에는 비효율
 - BCE classifier가 더 직관적이고 안정적
+
+---
+
+#### 3. World Model Consistency Loss — 물리적 타당성 regularization
+
+$$\mathcal{L}_{\text{world}} = \text{MSE}\left(\text{TP}(z_t,\ \hat{a}_t),\ \bar{z}_{t+1}\right)$$
+
+Phase 1에서 학습된 Temporal Predictor를 활용하여, **정책이 생성한 action이 물리적으로 타당한지** 검증.
+
+```python
+# 예측된 clean action 추출 (flow matching denoising 역산)
+x_0_pred = x_noisy - σ * v_pred          # â_t: predicted clean action [B, 7]
+
+# Temporal Predictor로 다음 상태 예측
+z_next_pred = TemporalPredictor(z_t, â_t)
+
+# Target: 실제 다음 상태 (EMA encoder, no gradient)
+z_next_target = TargetEncoder(obs_{t+1})
+
+world_loss = MSE(z_next_pred, z_next_target.detach())
+```
+
+**Weight**: $\lambda_{wm} = 0.1$
+
+**핵심 역할**: 정책이 생성한 action이 "다음 관측값을 설명할 수 있는" action인지 확인. Gradient는 `â_t → v_pred → 정책 파라미터` 경로로만 흐름 (Encoder, Temporal Predictor는 frozen).
 
 ---
 
@@ -451,40 +476,48 @@ cd ..
 
 ### Phase 1 — Temporal JEPA
 
+Single GPU:
 ```bash
 python train.py --config conf/config.yaml --phase 1
+```
+
+Multi-GPU (DDP):
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train.py \
+    --config conf/config.yaml \
+    --phase 1 \
+    --batch_size 128
 ```
 
 ### Phase 2 — Flow Matching
 
 ```bash
-python train.py \
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train.py \
     --config conf/config.yaml \
     --phase 2 \
-    --phase1_checkpoint checkpoints/phase1_temporal_jepa/checkpoint_best.pt
+    --batch_size 128 \
+    --phase1_checkpoint checkpoints/phase1_XXXXXXXX_XXXXXX/checkpoint_best.pt
 ```
 
-Multi-GPU:
+### Resume Training
 
 ```bash
-torchrun --nproc_per_node=4 train.py --config conf/config.yaml --phase 1
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train.py \
+    --config conf/config.yaml \
+    --phase 1 \
+    --batch_size 128 \
+    --checkpoint checkpoints/phase1_XXXXXXXX_XXXXXX/checkpoint_latest.pt
 ```
 
 ---
 
 ## Evaluation
 
-Offline evaluation:
-
-```bash
-python eval.py --checkpoint checkpoints/phase2_flow_matching/checkpoint_best.pt
-```
-
 LIBERO simulation:
 
 ```bash
 python run_libero_eval.py \
-    --checkpoint checkpoints/phase2_flow_matching/checkpoint_best.pt \
+    --checkpoint checkpoints/phase2_XXXXXXXX_XXXXXX/checkpoint_best.pt \
     --task_suite libero_object \
     --num_trials 50
 ```

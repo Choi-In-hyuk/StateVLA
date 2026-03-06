@@ -131,8 +131,8 @@ class StateVLADataset(Dataset):
             if filename.endswith('_demo'):
                 filename = filename[:-5]
 
-            # Get task embedding
-            task_emb = self.tasks.get(filename, torch.zeros(512))
+            # Get task embedding; pkl stores [1, 512] tensors, fallback matches shape
+            task_emb = self.tasks.get(filename, torch.zeros(1, 512))
 
             filepath = os.path.join(self.data_directory, file)
             with h5py.File(filepath, 'r') as f:
@@ -209,14 +209,11 @@ class StateVLADataset(Dataset):
         return torch.cat(result, dim=0)
 
     def _compute_action_stats(self):
-        """Compute action normalization statistics (mean, std) for pos/rot only."""
+        """Compute action normalization statistics (mean, std) for all 7 dims."""
         all_actions = self.get_all_actions()
 
-        # Only normalize position/rotation (first 6 dims), not gripper
-        pos_rot_actions = all_actions[:, :6]
-
-        self.action_mean = pos_rot_actions.mean(dim=0)  # [6]
-        self.action_std = pos_rot_actions.std(dim=0)    # [6]
+        self.action_mean = all_actions.mean(dim=0)  # [7]
+        self.action_std = all_actions.std(dim=0)    # [7]
 
         # Prevent division by zero
         self.action_std = torch.clamp(self.action_std, min=1e-6)
@@ -226,7 +223,7 @@ class StateVLADataset(Dataset):
 
     def normalize_actions(self, actions: torch.Tensor) -> torch.Tensor:
         """
-        Normalize actions (pos/rot only, gripper unchanged).
+        Normalize all 7 action dims.
 
         Args:
             actions: [B, seq_len, 7] or [seq_len, 7]
@@ -234,14 +231,11 @@ class StateVLADataset(Dataset):
         Returns:
             normalized actions
         """
-        normalized = actions.clone()
-        # Normalize only pos/rot (first 6 dims)
-        normalized[..., :6] = (actions[..., :6] - self.action_mean.to(actions.device)) / self.action_std.to(actions.device)
-        return normalized
+        return (actions - self.action_mean.to(actions.device)) / self.action_std.to(actions.device)
 
     def denormalize_actions(self, actions: torch.Tensor) -> torch.Tensor:
         """
-        Denormalize actions (pos/rot only, gripper unchanged).
+        Denormalize all 7 action dims.
 
         Args:
             actions: [B, seq_len, 7] or [seq_len, 7]
@@ -249,10 +243,7 @@ class StateVLADataset(Dataset):
         Returns:
             denormalized actions
         """
-        denormalized = actions.clone()
-        # Denormalize only pos/rot (first 6 dims)
-        denormalized[..., :6] = actions[..., :6] * self.action_std.to(actions.device) + self.action_mean.to(actions.device)
-        return denormalized
+        return actions * self.action_std.to(actions.device) + self.action_mean.to(actions.device)
 
     def get_action_stats(self) -> Dict[str, torch.Tensor]:
         """Get action normalization statistics."""
