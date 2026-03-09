@@ -21,6 +21,42 @@ from typing import Dict, Optional, List
 from state_encoder import JEPAStateEncoder
 from jepa.temporal_predictor import compute_temporal_jepa_loss
 from action_policy import ActionPolicy
+from utils import MLP
+
+
+class GoalPredictor(nn.Module):
+    """
+    Predicts goal latent state z_goal from current state z_t.
+
+    z_t → MLP → z_goal  (predicts z_{t+H}, H = action_seq_len steps ahead)
+
+    Training signal: MSE(z_goal, target_encoder(obs_{t+H}))
+    This gives the action policy a "where to go" signal in latent space.
+    """
+
+    def __init__(self, state_dim: int = 256, hidden_dim: int = 512):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.SiLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, state_dim),
+        )
+        # Initialize last layer small for stable start
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, z_t: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            z_t: [B, state_dim] current latent state
+        Returns:
+            z_goal: [B, state_dim] predicted goal latent state
+        """
+        return self.net(z_t)
 
 
 class StateVLA(nn.Module):
@@ -68,6 +104,8 @@ class StateVLA(nn.Module):
         policy_embed_dim: int = 256,
         # Temporal predictor config
         temporal_hidden_dim: int = 512,
+        # Goal predictor config
+        goal_predictor_hidden_dim: int = 512,
         # Training phase
         training_phase: int = 1,
         # Device
@@ -109,7 +147,13 @@ class StateVLA(nn.Module):
             device=device,
         )
 
-        # Action Policy (only needed for Phase 2 and inference)
+        # Goal Predictor (Phase 2: predicts z_{t+H} from z_t)
+        self.goal_predictor = GoalPredictor(
+            state_dim=state_dim,
+            hidden_dim=goal_predictor_hidden_dim,
+        )
+
+        # Action Policy (Phase 2: conditioned on [z_t, z_goal])
         self.action_policy = ActionPolicy(
             state_dim=state_dim,
             action_dim=action_dim,
@@ -121,18 +165,21 @@ class StateVLA(nn.Module):
             device=device,
         )
 
-        # Action normalization buffers (all 7 dims: pos/rot + gripper)
-        self.register_buffer("action_mean", torch.zeros(7))
-        self.register_buffer("action_std", torch.ones(7))
+        # Action normalization buffers: min-max for [-1, 1] normalization
+        self.register_buffer("action_min", torch.zeros(7))
+        self.register_buffer("action_max", torch.ones(7))
 
-    def set_action_stats(self, mean: torch.Tensor, std: torch.Tensor):
+    def set_action_stats(self, action_min: torch.Tensor, action_max: torch.Tensor):
         """Set action normalization statistics from dataset."""
-        self.action_mean.copy_(mean)
-        self.action_std.copy_(std)
+        self.action_min.copy_(action_min)
+        self.action_max.copy_(action_max)
 
     def denormalize_actions(self, actions: torch.Tensor) -> torch.Tensor:
-        """Denormalize all 7 action dimensions."""
-        return actions * self.action_std + self.action_mean
+        """Denormalize actions from [-1, 1] to original range."""
+        action_min = self.action_min.to(actions.device)
+        action_max = self.action_max.to(actions.device)
+        action_range = (action_max - action_min).clamp(min=1e-6)
+        return (actions + 1.0) / 2.0 * action_range + action_min
 
     def freeze_encoder(self):
         """Freeze state encoder for Phase 2 training."""
@@ -171,7 +218,7 @@ class StateVLA(nn.Module):
         sigma: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """
-        Phase 2 forward pass: Flow Matching policy.
+        Phase 2 forward pass: GoalPredictor + Flow Matching policy.
 
         Args:
             obs_dict: Current observation
@@ -179,7 +226,7 @@ class StateVLA(nn.Module):
             sigma: [B] diffusion timestep
 
         Returns:
-            Dictionary with z_t, velocity, noise
+            Dictionary with z_t, z_goal, velocity, noise
         """
         batch_size = gt_actions.shape[0]
 
@@ -187,19 +234,23 @@ class StateVLA(nn.Module):
         with torch.no_grad():
             state_outputs = self.state_encoder(obs_dict)
         z_t = state_outputs["z_t"]
-        patch_features = state_outputs.get("patch_features")  # [B, 392, embed_dim]
+        patch_features = state_outputs.get("patch_features")
+
+        # Predict goal state in latent space
+        z_goal = self.goal_predictor(z_t)  # [B, state_dim]
 
         # Sample noise for flow matching (all 7 dims)
         noise = torch.randn_like(gt_actions)
         sigma_expanded = sigma.view(batch_size, 1, 1)
         noisy_actions = (1 - sigma_expanded) * gt_actions + sigma_expanded * noise
 
-        # Predict velocity for all 7 dims
-        error = torch.zeros_like(z_t)
-        velocity = self.action_policy(z_t, z_t, error, noisy_actions, sigma, spatial_features=patch_features)
+        # Predict velocity conditioned on [z_t, z_goal]
+        velocity = self.action_policy(z_t, z_goal, noisy_actions, sigma,
+                                      spatial_features=patch_features)
 
         return {
             "z_t": z_t,
+            "z_goal": z_goal,
             "velocity": velocity,
             "noise": noise,
         }
@@ -257,11 +308,12 @@ class StateVLA(nn.Module):
             z_t = self.state_encoder.encode(obs_dict)
             patch_features = None
 
-        # Generate actions from z_t + spatial features
-        error = torch.zeros_like(z_t)
+        # Predict goal state
+        z_goal = self.goal_predictor(z_t)
 
+        # Generate actions conditioned on [z_t, z_goal]
         actions = self.action_policy.generate_actions(
-            z_t, z_t, error, sample_steps, spatial_features=patch_features
+            z_t, z_goal, sample_steps, spatial_features=patch_features
         )
 
         # Denormalize pos/rot actions
@@ -312,7 +364,8 @@ class StateVLATrainer(nn.Module):
         covariance_weight: float = 0.04,
         ema_momentum: float = 0.996,
         ema_momentum_schedule: str = "cosine",
-        world_model_loss_weight: float = 0.1,
+        world_model_loss_weight: float = 0.0,
+        goal_loss_weight: float = 0.1,
     ):
         super().__init__()
         self.model = model
@@ -323,6 +376,7 @@ class StateVLATrainer(nn.Module):
         self.ema_momentum = ema_momentum
         self.ema_momentum_schedule = ema_momentum_schedule
         self.world_model_loss_weight = world_model_loss_weight
+        self.goal_loss_weight = goal_loss_weight
 
     def compute_action_loss(
         self,
@@ -394,20 +448,23 @@ class StateVLATrainer(nn.Module):
         self,
         obs_dict: Dict[str, torch.Tensor],
         gt_actions: torch.Tensor,
-        next_obs_dict: Optional[Dict[str, torch.Tensor]] = None,
+        goal_obs_dict: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Phase 2 training: Flow Matching action loss (all 7 dims).
+        Phase 2 training: GoalPredictor + Flow Matching action loss.
 
-        Optionally adds World Model Consistency Loss:
-          - 예측한 clean action â_t를 temporal predictor에 넣어 ẑ_{t+1} 예측
-          - 실제 z_{t+1} (target encoder)과 비교 → policy가 물리적으로 타당한 action 생성하도록 유도
-          - Gradient: L_world → z_next_pred → temporal_predictor(z_t, â_t) → â_t → velocity → policy
+        Loss = L_action (flow matching) + λ_goal * L_goal (goal prediction)
+
+        L_goal: MSE(z_goal_pred, z_{t+H}_target)
+          - z_goal_pred: GoalPredictor(z_t)
+          - z_{t+H}_target: target encoder(obs_{t+action_seq_len})
+          - Gradient flows: L_goal → z_goal → GoalPredictor params
+          - Also flows into action policy via [z_t, z_goal] conditioning
 
         Args:
             obs_dict: Current observation
-            gt_actions: [B, action_seq_len, action_dim] ground truth actions (7 dims)
-            next_obs_dict: Next observation (optional, required for world model loss)
+            gt_actions: [B, action_seq_len, action_dim] ground truth actions
+            goal_obs_dict: Observation at t+action_seq_len (for goal loss GT)
 
         Returns:
             Dictionary with losses
@@ -420,42 +477,24 @@ class StateVLATrainer(nn.Module):
 
         outputs = self.model.forward_phase2(obs_dict, gt_actions, sigma)
 
-        # Unified 7D flow matching loss
+        # Flow matching loss
         action_loss, pos_rot_loss, gripper_loss = self.compute_action_loss(
             outputs["velocity"],
             outputs["noise"],
             gt_actions,
         )
-
         total_loss = self.action_loss_weight * action_loss
 
-        # World Model Consistency Loss
-        # Phase 1에서 학습한 temporal predictor 재활용:
-        #   "이 action을 하면 다음 상태가 이렇게 될 것이다"를 Phase 2 policy 학습에 활용
-        world_model_loss = torch.tensor(0.0, device=device)
-        if next_obs_dict is not None and self.world_model_loss_weight > 0:
-            # Flow matching 예측에서 clean action 추정:
-            # noisy_a = (1-σ)*gt_a + σ*noise, velocity = noise - gt_a
-            # → x_0_pred = noisy_a - σ * v_pred  (predicted clean action)
-            sigma_expanded = sigma.view(batch_size, 1, 1)
-            noisy_actions = (1 - sigma_expanded) * gt_actions + sigma_expanded * outputs["noise"]
-            x_0_pred = noisy_actions - sigma_expanded * outputs["velocity"]  # [B, T, 7]
-            a_t_pred = x_0_pred[:, 0, :]  # 첫 번째 action을 a_t로 사용 [B, 7]
-
-            # World model forward: TemporalPredictor(z_t, â_t) → ẑ_{t+1}
-            # - z_t: no_grad (frozen encoder에서 생성됨)
-            # - temporal_predictor params: no_grad (frozen encoder의 일부)
-            # → gradient는 오직 a_t_pred → velocity → policy로만 흐름 ✓
-            state_encoder = self.model.state_encoder
-            z_t = outputs["z_t"]
-            z_next_pred = state_encoder.temporal_predictor(z_t, a_t_pred)
-
-            # 실제 z_{t+1}: target encoder로 계산 (no gradient)
+        # Goal prediction loss: z_goal vs actual z_{t+H}
+        goal_loss = torch.tensor(0.0, device=device)
+        if goal_obs_dict is not None and self.goal_loss_weight > 0:
             with torch.no_grad():
-                z_next_target = state_encoder._encode_obs(next_obs_dict, use_target=True)["z"]
+                z_goal_target = self.model.state_encoder._encode_obs(
+                    goal_obs_dict, use_target=True
+                )["z"]  # [B, state_dim]
 
-            world_model_loss = F.mse_loss(z_next_pred, z_next_target.detach())
-            total_loss = total_loss + self.world_model_loss_weight * world_model_loss
+            goal_loss = F.mse_loss(outputs["z_goal"], z_goal_target.detach())
+            total_loss = total_loss + self.goal_loss_weight * goal_loss
 
         return {
             "loss": total_loss,
@@ -466,7 +505,7 @@ class StateVLATrainer(nn.Module):
             "action_loss": action_loss,
             "pos_rot_loss": pos_rot_loss,
             "gripper_loss": gripper_loss,
-            "world_model_loss": world_model_loss,
+            "goal_loss": goal_loss,
             "z_t": outputs["z_t"],
         }
 
@@ -479,19 +518,21 @@ class StateVLATrainer(nn.Module):
         # Phase 1 specific
         next_obs_dict: Optional[Dict[str, torch.Tensor]] = None,
         action: Optional[torch.Tensor] = None,
+        # Phase 2 specific
+        goal_obs_dict: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Unified training forward pass.
 
         Phase 1: requires next_obs_dict, action
-        Phase 2: requires gt_actions
+        Phase 2: requires gt_actions, goal_obs_dict (optional, for goal loss)
         """
         if self.model.training_phase == 1:
             return self.forward_phase1(
                 obs_dict, next_obs_dict, action, step, total_steps
             )
         else:
-            return self.forward_phase2(obs_dict, gt_actions, next_obs_dict)
+            return self.forward_phase2(obs_dict, gt_actions, goal_obs_dict)
 
     def update_target_encoder(self, step: int, total_steps: int):
         """Update target encoder with scheduled momentum."""

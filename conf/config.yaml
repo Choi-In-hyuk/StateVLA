@@ -11,7 +11,7 @@ data:
 model:
   # Tokenizer Configuration
   image_size: 224
-  patch_size: 16  # 14x14 = 196 patches per image
+  patch_size: 16  # SigLIP: 16x16 patches → 196 patches per image (224/16=14)
   embed_dim: 256
 
   # [추가됨] Pretrained Backbone Configuration (SigLIP & CLIP)
@@ -49,13 +49,16 @@ model:
   action_dim: 7
   action_seq_len: 10
 
+  # Goal Predictor Configuration
+  goal_predictor_hidden_dim: 512  # GoalPredictor hidden dim
+
   # Action Policy Configuration
   policy_layers: 3
   policy_embed_dim: 256
 
 # ============= Training Configuration =============
 training:
-  batch_size: 256
+  batch_size: 128
   num_epochs: 2000
   learning_rate: 1.0e-4
   weight_decay: 0.05
@@ -64,7 +67,8 @@ training:
   # Loss Weights
   jepa_loss_weight: 1.0
   action_loss_weight: 1.0
-  world_model_loss_weight: 0.0  # Phase 2: world model consistency (temporal predictor 재활용)
+  world_model_loss_weight: 0.0  # Phase 2: world model consistency (disabled)
+  goal_loss_weight: 0.1         # Phase 2: goal predictor loss weight
 
   # VICReg Regularization Weights
   variance_weight: 1.0
@@ -83,18 +87,20 @@ training:
   # Checkpointing
   save_interval: 200
   checkpoint_dir: "checkpoints"
+  val_ratio: 0.1      # 10% validation split
+  val_interval: 1     # validate every epoch
 
   # ---- Phase 1: Temporal JEPA ----
   phase1:
-    num_epochs: 1000
+    num_epochs: 2000
     learning_rate: 1.0e-4
     temporal_predictor_hidden_dim: 512
 
   # ---- Phase 2: Flow Matching ----
   phase2:
     num_epochs: 3000
-    learning_rate: 5.0e-5
-    scheduler_epochs: 1000   # CosineAnnealingLR T_max (num_epochs와 별개)
+    learning_rate: 1.0e-5
+    scheduler_epochs: 3000   # CosineAnnealingLR T_max (num_epochs와 별개)
     phase1_checkpoint: null
 
 # ============= Camera & Device =============

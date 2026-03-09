@@ -252,24 +252,35 @@ class MultiModalTokenizer(nn.Module):
     ):
         from transformers import AutoModel, AutoConfig
 
-        print(f"Loading shared SigLIP encoder: {model_name}...")
+        is_dinov2 = "dinov2" in model_name.lower()
+        print(f"Loading shared {'DINOv2' if is_dinov2 else 'SigLIP'} encoder: {model_name}...")
 
         config = AutoConfig.from_pretrained(model_name)
-        if hasattr(config, "vision_config"):
-            vision_config = config.vision_config
-            self.hidden_size = vision_config.hidden_size
-            image_size = vision_config.image_size
-            patch_size = vision_config.patch_size
+
+        if is_dinov2:
+            self.hidden_size = config.hidden_size          # 768
+            image_size = config.image_size                 # 224
+            patch_size = config.patch_size                 # 14
+            self.is_dinov2 = True
         else:
-            self.hidden_size = getattr(config, "hidden_size", 768)
-            image_size = getattr(config, "image_size", 224)
-            patch_size = getattr(config, "patch_size", 16)
+            self.is_dinov2 = False
+            if hasattr(config, "vision_config"):
+                vision_config = config.vision_config
+                self.hidden_size = vision_config.hidden_size
+                image_size = vision_config.image_size
+                patch_size = vision_config.patch_size
+            else:
+                self.hidden_size = getattr(config, "hidden_size", 768)
+                image_size = getattr(config, "image_size", 224)
+                patch_size = getattr(config, "patch_size", 16)
 
         self.num_patches_per_image = (image_size // patch_size) ** 2
         self.vision_image_size = image_size
 
         model = AutoModel.from_pretrained(model_name, torch_dtype=torch.float32)
-        if hasattr(model, "vision_model"):
+        if is_dinov2:
+            self.vision_encoder = model  # DINOv2 is the model itself
+        elif hasattr(model, "vision_model"):
             self.vision_encoder = model.vision_model
         elif hasattr(model, "vision_tower"):
             self.vision_encoder = model.vision_tower
@@ -295,7 +306,8 @@ class MultiModalTokenizer(nn.Module):
         for name in camera_names:
             nn.init.trunc_normal_(self.image_pos_embeds[name], std=0.02)
         print(
-            f"SigLIP loaded. Hidden: {self.hidden_size}, Patches per img: {self.num_patches_per_image}"
+            f"{'DINOv2' if is_dinov2 else 'SigLIP'} loaded. "
+            f"Hidden: {self.hidden_size}, Patches per img: {self.num_patches_per_image}"
         )
 
     def _encode_image_pretrained(
@@ -318,10 +330,12 @@ class MultiModalTokenizer(nn.Module):
             else outputs
         )
 
+        # DINOv2: CLS token at position 0, patch tokens follow
+        # SigLIP: may or may not have CLS token
         if features.shape[1] == self.num_patches_per_image + 1:
-            features = features[:, 1:]  # Remove CLS token if exists
+            features = features[:, 1:]  # Remove CLS token
 
-        # Cast to float32 before projection to avoid dtype mismatch with bf16 models
+        # Cast to float32 before projection to avoid dtype mismatch
         features = self.image_projections[camera_name](features.float())
         features = features + self.image_pos_embeds[camera_name]
         return features

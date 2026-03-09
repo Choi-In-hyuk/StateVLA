@@ -1,6 +1,6 @@
 # StateVLA: State-based Vision-Language-Action Model
 
-**Physics-aware Representation Learning via Temporal JEPA and Smooth Action Generation via Flow Matching**
+**Physics-aware Representation Learning via Temporal JEPA and Goal-Conditioned Smooth Action Generation via Flow Matching**
 
 ---
 
@@ -8,7 +8,7 @@
 
 StateVLA is a lightweight yet high-performance Vision-Language-Action (VLA) model designed for real-time robotic control. Unlike traditional end-to-end VLA architectures that directly map observations to actions, StateVLA separates **world representation learning** and **policy learning**, enabling more stable training, smoother actions, and significantly faster inference.
 
-The model first learns **physics-aware latent state representations** using Temporal Joint Embedding Predictive Architecture (Temporal JEPA), and then generates continuous robot trajectories using **Flow Matching** conditioned on the learned latent state. By leveraging pretrained SigLIP vision encoders, CLIP language embeddings, and an efficient **Mamba State Space Model (SSM)** backbone, StateVLA achieves real-time capable inference while maintaining strong manipulation performance.
+The model first learns **physics-aware latent state representations** using Temporal Joint Embedding Predictive Architecture (Temporal JEPA), and then generates continuous robot trajectories using **goal-conditioned Flow Matching**. A lightweight **GoalPredictor** module bridges the two phases by predicting the expected latent state after the action chunk executes, conditioning the policy on both the current state and the goal state. By leveraging pretrained SigLIP vision encoders, CLIP language embeddings, and an efficient **Mamba State Space Model (SSM)** backbone, StateVLA achieves real-time capable inference while maintaining strong manipulation performance.
 
 ---
 
@@ -21,7 +21,8 @@ Phase 1: Representation Learning
 obs_t, action_t  →  latent dynamics learning (Temporal JEPA)
 
 Phase 2: Policy Learning
-latent state z_t → continuous trajectory generation (Flow Matching)
+latent state z_t  →  GoalPredictor → z_goal
+[z_t, z_goal]     →  continuous trajectory generation (Flow Matching)
 ```
 
 This decoupled training stabilizes optimization and ensures the encoder captures physical causality before policy learning begins.
@@ -76,11 +77,17 @@ Phase 1 │ Temporal Predictor (JEPA)                 │
         └─────────────────────┬─────────────────────┘
                               │
 Phase 2                       ▼
-                    Flow Matching Policy
-                      (Trajectory Model)
+                    GoalPredictor (MLP)
+                    z_t → z_goal (H steps ahead)
+                              │
+                    [z_t, z_goal] concat (512D)
                               │
                               ▼
-                    Smooth Robot Actions
+                    Flow Matching Policy
+                    (Mamba + Cross-Attn, 7D unified)
+                              │
+                              ▼
+                    Smooth Robot Actions [B, 10, 7]
 ```
 
 ---
@@ -130,7 +137,7 @@ $$\mathcal{L}_{\text{MSE}} = \frac{1}{D} \sum_{i=1}^{D} \left( z'_{t+1,i} - \bar
 | $z'_{t+1}$ | `[B, 256]` | Temporal Predictor가 예측한 다음 상태 |
 | $\bar{z}_{t+1}$ | `[B, 256]` | Target Encoder가 인코딩한 실제 다음 상태 (detached, no gradient) |
 
-**핵심 역할**: "현재 상태 + action을 알면, 미래 상태를 예측할 수 있어야 한다"는 물리적 인과성을 학습. 이 loss가 메인 학습 신호.
+**핵심 역할**: "현재 상태 + action을 알면, 미래 상태를 예측할 수 있어야 한다"는 물리적 인과성을 학습.
 
 ```python
 # jepa/temporal_predictor.py:116
@@ -145,23 +152,9 @@ $$\mathcal{L}_{\text{var}} = \frac{1}{D} \sum_{j=1}^{D} \max\left(0,\ 1 - \sigma
 
 where $\sigma_j = \text{std}(z'_{t+1, :, j})$ is the standard deviation of dimension $j$ across the batch.
 
-| Condition | Meaning |
-|-----------|---------|
-| $\sigma_j \geq 1$ | Dimension $j$ has enough spread → loss = 0 (good) |
-| $\sigma_j < 1$ | Dimension $j$ is collapsing → penalized by $1 - \sigma_j$ (bad) |
-| All $\sigma_j = 0$ | Complete collapse: all samples map to same point |
-
-**핵심 역할**: 모든 입력이 동일한 representation으로 매핑되는 trivial solution을 방지. 이 loss 없이는 encoder가 상수 함수를 학습해서 MSE = 0이 되는 shortcut을 찾을 수 있음.
-
-```python
-# jepa/temporal_predictor.py:119-120
-std_pred = z_next_pred.std(dim=0)          # [D] — 배치 내 각 차원의 표준편차
-var_loss = F.relu(1.0 - std_pred).mean()   # std < 1인 차원에 penalty
-```
+**핵심 역할**: 모든 입력이 동일한 representation으로 매핑되는 trivial solution을 방지.
 
 **Weight**: $\lambda_v = 1.0$
-
-**모니터링**: `jepa_variance` → 0에 가까울수록 collapse 없이 잘 학습되고 있음
 
 ---
 
@@ -169,48 +162,11 @@ var_loss = F.relu(1.0 - std_pred).mean()   # std < 1인 차원에 penalty
 
 $$\mathcal{L}_{\text{cov}} = \frac{1}{D} \sum_{i \neq j} C_{ij}^2$$
 
-where $C$ is the covariance matrix:
+**핵심 역할**: 256개 차원이 각각 다른 정보를 담도록 강제.
 
-$$C = \frac{1}{B-1} \hat{z}'^{\,T} \hat{z}', \quad \hat{z}' = z' - \text{mean}(z', \text{dim}=0)$$
-
-| Condition | Meaning |
-|-----------|---------|
-| $C_{ij} = 0\ (i \neq j)$ | Dimension $i$와 $j$는 독립적 → loss = 0 (good) |
-| $C_{ij} \neq 0\ (i \neq j)$ | Dimension $i$와 $j$가 상관관계 → penalized (bad) |
-| Diagonal $C_{ii}$ | 무시 (각 차원의 분산, variance loss가 관리) |
-
-**핵심 역할**: 256개 차원이 각각 다른 정보를 담도록 강제. 이 loss 없이는 여러 차원이 동일한 feature를 중복 인코딩하여 representation capacity가 낭비됨.
-
-```python
-# jepa/temporal_predictor.py:122-126
-pred_centered = z_next_pred - z_next_pred.mean(dim=0, keepdim=True)
-cov = (pred_centered.T @ pred_centered) / (B - 1 + 1e-8)   # [D, D] 공분산 행렬
-off_diag = cov - torch.diag(torch.diag(cov))                # 대각선 제거
-cov_loss = (off_diag ** 2).sum() / D                         # 비대각 원소의 제곱합
-```
-
-**Weight**: $\lambda_c = 0.04$ (MSE 대비 낮은 가중치 — 보조 정규화 역할)
-
-**모니터링**: `jepa_covariance` → 0에 가까울수록 차원 간 redundancy가 없음
+**Weight**: $\lambda_c = 0.04$
 
 ---
-
-#### Why VICReg? (Variance + Covariance)
-
-Self-supervised latent prediction은 **representation collapse** 위험이 있음:
-
-```
-Without VICReg:
-  encoder → 모든 입력을 동일 벡터로 매핑 → MSE = 0 (trivial solution)
-  결과: 아무것도 학습하지 않음
-
-With VICReg:
-  Variance  → 각 차원이 충분히 퍼져야 함 (collapse 방지)
-  Covariance → 각 차원이 서로 다른 정보를 담아야 함 (redundancy 방지)
-  결과: 256D 공간을 최대한 활용하는 의미 있는 representation 학습
-```
-
-Contrastive learning (SimCLR 등)과 달리 negative pair가 필요 없어, 배치 내 모든 샘플을 활용하여 더 안정적으로 학습.
 
 ### EMA Target Encoder
 
@@ -224,60 +180,69 @@ Cosine momentum schedule:
   t=T:  m → 1.0    (target이 거의 고정, 매우 안정적)
 ```
 
-| Property | Description |
-|----------|-------------|
-| Gradient | Target encoder는 gradient를 **절대 받지 않음** |
-| Update | Context encoder의 EMA copy로만 업데이트 |
-| Early training | 낮은 momentum → target이 context를 빠르게 따라감 |
-| Late training | 높은 momentum → target이 거의 고정되어 안정적 학습 target 제공 |
-
 ---
 
-## Phase 2 — Flow Matching Policy
+## Phase 2 — Goal-Conditioned Flow Matching
 
-> "주어진 상태 z_t에서, 어떤 action trajectory를 생성해야 할까?"
+> "현재 상태 z_t에서, H step 후 목표 z_goal을 향해 어떤 action trajectory를 생성해야 할까?"
 
-Encoder는 Phase 1에서 학습된 가중치로 **완전히 freeze**하고, action 생성 모듈만 학습. Phase 1에서 학습된 z_t는 이미 물리적 인과성을 이해하는 rich representation이므로, 이를 직접 conditioning으로 사용.
+Encoder와 Temporal Predictor는 Phase 1 가중치로 **완전히 freeze**하고, GoalPredictor와 Flow Matching Policy만 학습.
 
-> Temporal Predictor는 Phase 1에서 좋은 latent space를 만들기 위한 pretext task 역할. Phase 2에서는 잘 학습된 z_t만으로 충분.
+### GoalPredictor
+
+```
+z_t (256D) ──→ MLP (256 → 512 → 512 → 256) ──→ z_goal (256D)
+```
+
+GoalPredictor는 현재 latent state에서 action_seq_len (H=10) step 후의 latent state를 예측. 이를 `z_goal`이라 하며, Flow Matching Policy가 "어디로 가야 하는지"를 알 수 있도록 conditioning을 제공.
+
+**Goal Loss:**
+
+$$\mathcal{L}_{\text{goal}} = \text{MSE}\left(z_{\text{goal}},\ \bar{z}_{t+H}\right)$$
+
+where $\bar{z}_{t+H}$ is the EMA target encoder applied to `obs_{t+H}` (the observation H steps ahead, detached).
 
 ### Forward Pass
 
 ```
 obs_t ──→ Frozen Encoder ──→ z_t (256D, no gradient)
                                │
-                  ┌────────────┴────────────┐
-                  ▼                         ▼
-       ┌─────────────────┐      ┌──────────────────┐
-       │  Flow Matching   │      │ Gripper Classifier│
-       │  (Mamba 3L)      │      │ (MLP)            │
-       │                  │      │                   │
-       │  Input tokens:   │      │ z_t               │
-       │  [σ_emb(1),      │      │   → Linear(256)   │
-       │   z_emb(1),      │      │   → SiLU           │
-       │   a_noisy(10)]   │      │   → Linear(256)   │
-       │  = 12 tokens     │      │   → SiLU           │
-       │                  │      │   → Linear(10)    │
-       │  Mamba 3L        │      │  = 10 logits      │
-       │  → MLP head      │      │                   │
-       │  → velocity(6D)  │      │ Loss: BCE          │
-       │                  │      │                   │
-       │  Loss: MSE       │      └────────┬─────────┘
-       └────────┬─────────┘               │
-                └──────┬──────────────────┘
-                       ▼
-             [pos_rot(6D), gripper(1D)] × 10 steps = action [B, 10, 7]
+                               ↓
+                    GoalPredictor (MLP)
+                               │
+                           z_goal (256D)
+                               │
+          concat([z_t, z_goal]) = z_state (512D)
+                               │
+                               ↓
+         ┌──────────────────────────────────────┐
+         │  Flow Matching Policy (Mamba 3L)      │
+         │                                      │
+         │  Input tokens:                       │
+         │  [σ_emb(1), state_emb(1),            │
+         │   a_noisy × 10]                      │
+         │  = 12 tokens                         │
+         │                                      │
+         │  Mamba 3L backbone                   │
+         │     ↓                                │
+         │  Cross-Attn to image patches         │  ← spatial_features [B, N, 256]
+         │     ↓                                │
+         │  velocity [B, 10, 7]                 │
+         │  Loss: MSE (all 7 dims unified)      │
+         └──────────────────────────────────────┘
 ```
 
 ### Loss Function (Phase 2)
 
-$$\mathcal{L}_{\text{phase2}} = \mathcal{L}_{\text{flow}} + \mathcal{L}_{\text{gripper}} + \lambda_{wm} \cdot \mathcal{L}_{\text{world}}$$
+$$\mathcal{L}_{\text{phase2}} = \mathcal{L}_{\text{flow}} + \lambda_{\text{goal}} \cdot \mathcal{L}_{\text{goal}}$$
+
+$$\mathcal{L}_{\text{phase2}} = \mathcal{L}_{\text{flow}} + 0.1 \cdot \mathcal{L}_{\text{goal}}$$
 
 ---
 
-#### 1. Flow Matching Loss — Position/Rotation (6D) 연속 action 생성
+#### 1. Flow Matching Loss — 통합 7D Action 생성
 
-Flow Matching은 noise에서 시작하여 ground truth action으로 향하는 **velocity field**를 학습.
+모든 7차원 action (pos/rot 6D + gripper 1D)을 단일 Flow Matching으로 처리.
 
 **학습 과정 (Training):**
 
@@ -286,114 +251,75 @@ Flow Matching은 noise에서 시작하여 ground truth action으로 향하는 **
 σ ~ Uniform(0, 1)                           # [B]
 
 # Step 2: Gaussian noise 샘플링
-ε ~ N(0, I)                                 # [B, 10, 6]
+ε ~ N(0, I)                                 # [B, 10, 7]
 
 # Step 3: Linear interpolation으로 noisy action 생성
-x_noisy = (1 - σ) · x_0 + σ · ε            # x_0 = ground truth pos/rot [B, 10, 6]
-#  σ=0 → x_noisy = x_0 (clean)
-#  σ=1 → x_noisy = ε   (pure noise)
+x_noisy = (1 - σ) · x_0 + σ · ε            # x_0 = ground truth actions (normalized) [B, 10, 7]
 
-# Step 4: Target velocity 계산 (optimal transport 방향)
-v_target = ε - x_0                          # noise에서 data로 향하는 방향의 반대
+# Step 4: Target velocity 계산
+v_target = ε - x_0
 
-# Step 5: Mamba policy가 velocity 예측
-v_pred = FlowMatchingPolicy(σ, z_t, x_noisy)  # [B, 10, 6]
+# Step 5: Policy가 velocity 예측
+v_pred = FlowMatchingPolicy(σ, z_state, x_noisy, spatial_features)  # [B, 10, 7]
 ```
 
 **Loss:**
 
-$$\mathcal{L}_{\text{flow}} = \text{MSE}(v_{\text{pred}},\ v_{\text{target}}) = \frac{1}{10 \times 6} \sum \left( v_{\text{pred}} - (\varepsilon - x_0) \right)^2$$
-
-```python
-# statevla_model.py:361-362
-target_velocity = noise - pos_rot_actions
-pos_rot_loss = F.mse_loss(velocity_pred, target_velocity)
-```
+$$\mathcal{L}_{\text{flow}} = \text{MSE}(v_{\text{pred}},\ v_{\text{target}}) = \frac{1}{10 \times 7} \sum \left( v_{\text{pred}} - (\varepsilon - x_0) \right)^2$$
 
 | Symbol | Shape | Description |
 |--------|-------|-------------|
-| $x_0$ | `[B, 10, 6]` | Ground truth pos/rot actions (normalized) |
-| $\varepsilon$ | `[B, 10, 6]` | Sampled Gaussian noise |
+| $x_0$ | `[B, 10, 7]` | Ground truth actions (min-max normalized to [-1, 1]) |
+| $\varepsilon$ | `[B, 10, 7]` | Sampled Gaussian noise |
 | $\sigma$ | `[B]` | Diffusion timestep (0=clean, 1=noise) |
-| $x_{\text{noisy}}$ | `[B, 10, 6]` | Interpolated noisy actions |
-| $v_{\text{target}}$ | `[B, 10, 6]` | Target velocity = $\varepsilon - x_0$ |
-| $v_{\text{pred}}$ | `[B, 10, 6]` | Mamba policy predicted velocity |
-
-**핵심 역할**: "임의의 noise level에서, noise를 제거하는 방향(velocity)을 정확히 예측"하는 것을 학습. 이를 통해 inference 시 pure noise에서 출발하여 iterative하게 clean action을 생성할 수 있음.
+| $z_{\text{state}}$ | `[B, 512]` | concat([z_t, z_goal]) — current + goal state |
 
 ---
 
-#### 2. Gripper BCE Loss — Gripper (1D) 이산 action 분류
+#### 2. Goal Prediction Loss — GoalPredictor 학습
 
-Gripper는 open(-1) / close(+1) 두 상태만 존재하므로 Flow Matching이 아닌 **binary classification**으로 처리.
+GoalPredictor가 예측한 z_goal과 실제 H step 후 Target Encoder 출력을 비교.
 
-$$\mathcal{L}_{\text{gripper}} = -\frac{1}{10} \sum_{k=1}^{10} \left[ y_k \log \hat{p}_k + (1 - y_k) \log(1 - \hat{p}_k) \right]$$
+$$\mathcal{L}_{\text{goal}} = \text{MSE}\left(z_{\text{goal}},\ \bar{z}_{t+H}\right)$$
 
-| Symbol | Shape | Description |
-|--------|-------|-------------|
-| Gripper GT | `[B, 10]` | Ground truth: {-1, +1} per timestep |
-| $y_k$ | `[B, 10]` | Binary target: $(gripper > 0)$ → {0, 1} |
-| Logits | `[B, 10]` | MLP classifier raw output |
-| $\hat{p}_k$ | `[B, 10]` | $\text{sigmoid}(\text{logit}_k)$ |
+**Weight**: $\lambda_{\text{goal}} = 0.1$
 
-```python
-# statevla_model.py:364-368
-gripper_binary = (gripper_targets > 0).float()          # {-1,1} → {0,1}
-gripper_loss = F.binary_cross_entropy_with_logits(
-    gripper_logits, gripper_binary
-)
-```
-
-**Gripper를 Flow Matching에서 분리한 이유:**
-- Gripper는 이산 값 {open, close} → 연속 denoising과 맞지 않음
-- Flow Matching은 연속 공간에서 smooth trajectory를 만드는 데 최적화 → 이산 binary action에는 비효율
-- BCE classifier가 더 직관적이고 안정적
+GoalPredictor를 통해 policy는 단순히 현재 상태를 모방하는 것을 넘어, 미래 목표 상태를 향해 행동하도록 유도됨.
 
 ---
 
-#### 3. World Model Consistency Loss — 물리적 타당성 regularization
+#### Action Normalization
 
-$$\mathcal{L}_{\text{world}} = \text{MSE}\left(\text{TP}(z_t,\ \hat{a}_t),\ \bar{z}_{t+1}\right)$$
-
-Phase 1에서 학습된 Temporal Predictor를 활용하여, **정책이 생성한 action이 물리적으로 타당한지** 검증.
+모든 7차원 action을 min-max scaling으로 [-1, 1]로 정규화:
 
 ```python
-# 예측된 clean action 추출 (flow matching denoising 역산)
-x_0_pred = x_noisy - σ * v_pred          # â_t: predicted clean action [B, 7]
+# 정규화 (dataloader)
+normalized = (action - action_min) / (action_max - action_min) * 2.0 - 1.0
 
-# Temporal Predictor로 다음 상태 예측
-z_next_pred = TemporalPredictor(z_t, â_t)
-
-# Target: 실제 다음 상태 (EMA encoder, no gradient)
-z_next_target = TargetEncoder(obs_{t+1})
-
-world_loss = MSE(z_next_pred, z_next_target.detach())
+# 역정규화 (inference)
+denormalized = (action + 1.0) / 2.0 * (action_max - action_min) + action_min
 ```
 
-**Weight**: $\lambda_{wm} = 0.1$
-
-**핵심 역할**: 정책이 생성한 action이 "다음 관측값을 설명할 수 있는" action인지 확인. Gradient는 `â_t → v_pred → 정책 파라미터` 경로로만 흐름 (Encoder, Temporal Predictor는 frozen).
+기존 z-score 대비 장점: 액션이 항상 [-1, 1] 범위에 있어 flow matching의 초기 noise scale과 잘 맞음.
 
 ---
 
 #### Inference (Action Generation)
 
-학습된 velocity field를 사용하여 pure noise에서 clean action을 **iterative하게 복원**:
-
 ```python
-# Euler method sampling (4 steps)
-x = N(0, I)                                 # Start from pure noise [B, 10, 6]
+# Pure noise에서 시작
+x = N(0, I)                                 # [B, 10, 7]
+
+# GoalPredictor: 목표 latent 예측
+z_goal = GoalPredictor(z_t)                 # [B, 256]
+z_state = concat([z_t, z_goal], dim=-1)    # [B, 512]
 
 for t in [1.0, 0.75, 0.5, 0.25]:            # 4 denoising steps
-    v = FlowMatchingPolicy(t, z_t, x)       # predict velocity at noise level t
-    x = x - (1/4) · v                       # Euler step: move toward clean data
+    v = FlowMatchingPolicy(t, z_state, x, spatial_features)
+    x = x - (1/4) · v                       # Euler step
 
-# Gripper: independent binary prediction (no denoising needed)
-logits = GripperClassifier(z_t)              # [B, 10]
-gripper = where(logits > 0, +1, -1)         # [B, 10, 1]
-
-# Combine
-action = concat(x, gripper, dim=-1)         # [B, 10, 7]
+# Min-max 역정규화
+action = denormalize(x)                     # [B, 10, 7]
 ```
 
 | Step | $t$ | State of $x$ |
@@ -404,20 +330,19 @@ action = concat(x, gripper, dim=-1)         # [B, 10, 7]
 | 3 | 0.50 | Fine details appear |
 | 4 | 0.25 | Clean action output |
 
-Steps를 늘리면 quality 향상, 줄이면 inference 속도 향상 (default: 4 steps)
-
 ---
 
 ## Model Components
 
-| Component          | Model           | Parameters | Trainable |
-| ------------------ | --------------- | ---------- | --------- |
-| Vision Backbone    | SigLIP ViT-B/16 | ~86M       | Frozen    |
-| Language Backbone  | CLIP ViT-B/32   | ~87M       | Frozen    |
-| Context Encoder    | Mamba SSM (12L) | ~12.3M     | Yes       |
-| Temporal Predictor | MLP             | ~1.1M      | Yes       |
-| Flow Policy        | Mamba SSM (3L)  | ~1.8M      | Yes       |
-| Total Trainable    | —               | ~15M       | —         |
+| Component          | Model                  | Parameters | Trainable |
+| ------------------ | ---------------------- | ---------- | --------- |
+| Vision Backbone    | SigLIP ViT-B/16        | ~86M       | Frozen    |
+| Language Backbone  | CLIP ViT-B/32          | ~87M       | Frozen    |
+| Context Encoder    | Mamba SSM (12L)        | ~12.3M     | Phase 1   |
+| Temporal Predictor | MLP                    | ~1.1M      | Phase 1   |
+| GoalPredictor      | MLP (256→512→512→256)  | ~0.5M      | Phase 2   |
+| Flow Policy        | Mamba SSM (3L) + CrossAttn | ~1.9M  | Phase 2   |
+| Total Trainable    | —                      | ~15.8M     | —         |
 
 ---
 
@@ -478,7 +403,7 @@ cd ..
 
 Single GPU:
 ```bash
-python train.py --config conf/config.yaml --phase 1
+CUDA_VISIBLE_DEVICES=1 python train.py --config conf/config.yaml --phase 1 --device cuda:0
 ```
 
 Multi-GPU (DDP):
@@ -489,7 +414,7 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train.py \
     --batch_size 128
 ```
 
-### Phase 2 — Flow Matching
+### Phase 2 — Goal-Conditioned Flow Matching
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train.py \
@@ -502,11 +427,14 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train.py \
 ### Resume Training
 
 ```bash
+# Resume phase 2 (with optimizer reset when changing LR)
 CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train.py \
     --config conf/config.yaml \
-    --phase 1 \
+    --phase 2 \
     --batch_size 128 \
-    --checkpoint checkpoints/phase1_XXXXXXXX_XXXXXX/checkpoint_latest.pt
+    --phase1_checkpoint checkpoints/phase1_XXXXXXXX_XXXXXX/checkpoint_best.pt \
+    --checkpoint checkpoints/phase2_XXXXXXXX_XXXXXX/checkpoint_latest.pt \
+    --reset_optimizer
 ```
 
 ---

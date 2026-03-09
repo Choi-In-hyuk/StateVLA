@@ -209,21 +209,21 @@ class StateVLADataset(Dataset):
         return torch.cat(result, dim=0)
 
     def _compute_action_stats(self):
-        """Compute action normalization statistics (mean, std) for all 7 dims."""
+        """Compute action normalization statistics (min, max) for [-1, 1] normalization."""
         all_actions = self.get_all_actions()
 
-        self.action_mean = all_actions.mean(dim=0)  # [7]
-        self.action_std = all_actions.std(dim=0)    # [7]
+        self.action_min = all_actions.min(dim=0)[0]  # [7]
+        self.action_max = all_actions.max(dim=0)[0]  # [7]
 
         # Prevent division by zero
-        self.action_std = torch.clamp(self.action_std, min=1e-6)
+        self.action_range = torch.clamp(self.action_max - self.action_min, min=1e-6)
 
-        log.info(f"Action stats - mean: {self.action_mean.numpy()}")
-        log.info(f"Action stats - std: {self.action_std.numpy()}")
+        log.info(f"Action stats - min: {self.action_min.numpy()}")
+        log.info(f"Action stats - max: {self.action_max.numpy()}")
 
     def normalize_actions(self, actions: torch.Tensor) -> torch.Tensor:
         """
-        Normalize all 7 action dims.
+        Normalize all 7 action dims to [-1, 1].
 
         Args:
             actions: [B, seq_len, 7] or [seq_len, 7]
@@ -231,11 +231,13 @@ class StateVLADataset(Dataset):
         Returns:
             normalized actions
         """
-        return (actions - self.action_mean.to(actions.device)) / self.action_std.to(actions.device)
+        action_min = self.action_min.to(actions.device)
+        action_range = self.action_range.to(actions.device)
+        return (actions - action_min) / action_range * 2.0 - 1.0
 
     def denormalize_actions(self, actions: torch.Tensor) -> torch.Tensor:
         """
-        Denormalize all 7 action dims.
+        Denormalize all 7 action dims from [-1, 1] to original range.
 
         Args:
             actions: [B, seq_len, 7] or [seq_len, 7]
@@ -243,13 +245,15 @@ class StateVLADataset(Dataset):
         Returns:
             denormalized actions
         """
-        return actions * self.action_std.to(actions.device) + self.action_mean.to(actions.device)
+        action_min = self.action_min.to(actions.device)
+        action_range = self.action_range.to(actions.device)
+        return (actions + 1.0) / 2.0 * action_range + action_min
 
     def get_action_stats(self) -> Dict[str, torch.Tensor]:
         """Get action normalization statistics."""
         return {
-            'mean': self.action_mean,
-            'std': self.action_std
+            'min': self.action_min,
+            'max': self.action_max,
         }
 
     def __len__(self) -> int:
@@ -368,7 +372,29 @@ class StateVLADataset(Dataset):
                 future_obs_list.append(future_obs)
                 future_valid_mask.append(0.0)
 
-        # Normalize actions (pos/rot only, gripper unchanged)
+        # Get goal observation at t + action_seq_len (for GoalPredictor training)
+        goal_obs = None
+        goal_idx = start + self.action_seq_len
+        if goal_idx < seq_length:
+            goal_agentview = self.agentview_rgb[i][goal_idx:goal_idx + 1]
+            goal_eye_in_hand = self.eye_in_hand_rgb[i][goal_idx:goal_idx + 1]
+
+            goal_agentview = torch.from_numpy(goal_agentview).float().permute(0, 3, 1, 2) / 255.0
+            goal_eye_in_hand = torch.from_numpy(goal_eye_in_hand).float().permute(0, 3, 1, 2) / 255.0
+
+            goal_agentview = TF.resize(goal_agentview, [self.image_size, self.image_size], antialias=True)
+            goal_eye_in_hand = TF.resize(goal_eye_in_hand, [self.image_size, self.image_size], antialias=True)
+
+            goal_robot_state = torch.from_numpy(self.robot_states[i][goal_idx:goal_idx + 1]).float()
+
+            goal_obs = {
+                "agentview_image": goal_agentview.squeeze(0),
+                "eye_in_hand_image": goal_eye_in_hand.squeeze(0),
+                "lang_emb": task_emb,
+                "robot_states": goal_robot_state.squeeze(0)
+            }
+
+        # Normalize actions to [-1, 1]
         actions_normalized = self.normalize_actions(actions)
         prev_action_normalized = self.normalize_actions(prev_action.unsqueeze(0)).squeeze(0)
 
@@ -378,6 +404,7 @@ class StateVLADataset(Dataset):
             "prev_action": prev_action_normalized,
             "mask": mask,
             "next_obs": next_obs,
+            "goal_obs": goal_obs,
             "future_obs_list": future_obs_list,
             "future_valid_mask": torch.tensor(future_valid_mask, dtype=torch.float32)
         }
@@ -447,12 +474,22 @@ def collate_fn(batch: List[Dict]) -> Dict:
             future_obs_list_batch.append(step_obs)
         future_valid_mask_batch = torch.stack([b["future_valid_mask"] for b in batch])
 
+    # Collect goal observations (for GoalPredictor training)
+    goal_obs_batch = None
+    has_goal_obs = batch[0].get("goal_obs") is not None
+    if has_goal_obs:
+        goal_obs_batch = {}
+        for key in obs_keys:
+            values = [b["goal_obs"][key] if b.get("goal_obs") is not None else b["obs"][key] for b in batch]
+            goal_obs_batch[key] = torch.stack(values)
+
     return {
         "obs": obs_batch,
         "actions": torch.stack([b["actions"] for b in batch]),
         "prev_action": torch.stack([b["prev_action"] for b in batch]),
         "mask": torch.stack([b["mask"] for b in batch]),
         "next_obs": next_obs_batch if has_next_obs else None,
+        "goal_obs": goal_obs_batch,
         "future_obs_list": future_obs_list_batch,
         "future_valid_mask": future_valid_mask_batch
     }

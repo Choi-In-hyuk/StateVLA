@@ -45,39 +45,47 @@
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### Phase 2: Flow Matching + World Model Consistency (정책 학습)
+### Phase 2: GoalPredictor + Flow Matching (정책 학습)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                      Phase 2: Flow Matching                         │
+│              Phase 2: Goal-Conditioned Flow Matching                 │
 │                                                                     │
 │  obs_t ──→ Frozen Encoder ──→ z_t (256D, no gradient)              │
 │                                 │                                   │
-│                    ┌────────────┴────────────┐                      │
-│                    ↓                         ↓                      │
-│          ┌─────────────────┐      ┌──────────────────┐             │
-│          │  Flow Matching  │      │ Gripper Classifier│             │
-│          │  (Mamba 3L)     │      │ (MLP 3L)         │             │
-│          │                 │      │                   │             │
-│          │  Input seq:     │      │ z_t → 256 → 256  │             │
-│          │  [σ, z_t,       │      │   → 10 logits    │             │
-│          │   a_noisy×10]   │      │                   │             │
-│          │     ↓           │      │ Loss: BCE         │             │
-│          │  Mamba backbone │      │ {-1,1} → {0,1}   │             │
-│          │     ↓           │      └────────┬─────────┘             │
-│          │  velocity (6D)  │               │                        │
-│          │  Loss: MSE      │               │                        │
-│          └────────┬────────┘               │                        │
-│                   └──────┬─────────────────┘                        │
-│                          ↓                                          │
-│                [pos_rot(6), gripper(1)] × 10 steps                  │
+│                                 ↓                                   │
+│                      ┌──────────────────┐                           │
+│                      │  GoalPredictor    │                           │
+│                      │  MLP(512 hidden)  │                           │
+│                      │  z_t → z_goal     │ ← "H step 후 상태 예측"  │
+│                      └────────┬─────────┘                           │
+│                               │                                     │
+│                 concat([z_t, z_goal]) = 512D                        │
+│                               │                                     │
+│                               ↓                                     │
+│              ┌────────────────────────────┐                         │
+│              │  Flow Matching Policy       │                         │
+│              │  (Mamba 3L + Cross-Attn)    │                         │
+│              │                             │                         │
+│              │  Input seq:                 │  ← spatial_features     │
+│              │  [σ_emb(1), state_emb(1),   │     (image patches)     │
+│              │   a_noisy(10)]              │                         │
+│              │     ↓                       │                         │
+│              │  Mamba backbone (3L)        │                         │
+│              │     ↓                       │                         │
+│              │  Cross-Attn to patches      │                         │
+│              │     ↓                       │                         │
+│              │  velocity [B, 10, 7]        │                         │
+│              │  Loss: MSE (all 7 dims)     │                         │
+│              └────────────────────────────┘                         │
+│                               │                                     │
+│  Goal Loss (weight=0.1):      │                                     │
+│    z_goal_target = TargetEncoder(obs_{t+H})                         │
+│    L_goal = MSE(z_goal, z_goal_target.detach())                     │
 │                                                                     │
-│  [추가] World Model Consistency Loss (weight=0.1):                  │
-│    â_t = x_noisy - σ · v_pred  (예측된 clean action)               │
-│    L_wm = MSE(TP(z_t, â_t), z_{t+1})                               │
-│    → 물리적으로 타당한 action만 생성하도록 regularization           │
+│  Total Loss: L_flow + 0.1 × L_goal                                  │
 │                                                                     │
-│  Trainable: Flow Matching Policy + Gripper Classifier               │
+│  Trainable: GoalPredictor + Flow Matching Policy                    │
 │  Frozen:    Encoder + Temporal Predictor (from Phase 1)             │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -94,8 +102,8 @@
 | Context Encoder | Mamba SSM × 12 layers | ~12.3M | d_model=256, d_state=16, d_conv=4 |
 | Target Encoder | EMA copy | shared | No gradient, momentum update |
 | Temporal Predictor | MLP (1024 → 512 → 512 → 256) | ~1.1M | Residual: z_{t+1} = z_t + delta |
-| Flow Matching Policy | Mamba SSM × 3 layers | ~1.8M | d_model=256, denoising |
-| Gripper Classifier | MLP (256 → 256 → 10) | ~132K | Binary per timestep |
+| GoalPredictor | MLP (256 → 512 → 512 → 256) | ~0.5M | z_t → z_goal (H step ahead in latent space) |
+| Flow Matching Policy | Mamba 3L + Cross-Attn | ~1.9M | Conditioned on [z_t, z_goal], all 7D |
 | **Total Trainable** | | **~14.9M** | |
 
 ---
@@ -124,10 +132,17 @@
 
 ### Action (Policy Output)
 
-| Dim | Range | Description | Training |
-|-----|-------|-------------|----------|
-| 0-5 | continuous | Position + Rotation (6D) | Flow Matching (normalized) |
-| 6 | {-1, +1} | Gripper open/close (binary) | BCE classifier (not normalized) |
+| Dim | Range | Description | Normalization |
+|-----|-------|-------------|---------------|
+| 0-5 | [-1, 1] | Position + Rotation (6D) | Min-max → [-1, 1] |
+| 6 | [-1, 1] | Gripper open/close | Min-max → [-1, 1] (unified flow matching) |
+
+**Action Normalization**: min-max scaling to [-1, 1] for all 7 dimensions.
+
+```python
+# dataloader.py
+normalized = (action - action_min) / (action_max - action_min) * 2.0 - 1.0
+```
 
 ---
 
@@ -137,9 +152,10 @@
 
 Single GPU:
 ```bash
-python /home/choi/StateVLA/train.py \
+CUDA_VISIBLE_DEVICES=1 python /home/choi/StateVLA/train.py \
   --config /home/choi/StateVLA/conf/config.yaml \
-  --phase 1
+  --phase 1 \
+  --device cuda:0
 ```
 
 Multi-GPU (DDP, 2x GPU, batch 128/GPU = effective 256):
@@ -158,7 +174,7 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 /home/choi/StateVLA/train.p
 
 **완료 기준**: jepa_mse가 수렴하고, variance가 0 근처로 안정화
 
-### Phase 2: Flow Matching
+### Phase 2: Goal-Conditioned Flow Matching
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 /home/choi/StateVLA/train.py \
@@ -170,9 +186,8 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 /home/choi/StateVLA/train.p
 ```
 
 **Monitoring**:
-- `pos_rot_loss`: position/rotation Flow Matching loss
-- `gripper_loss`: gripper BCE loss
-- `wm`: world model consistency loss (물리적 타당성 regularization)
+- `action`: flow matching loss (all 7 dims, 낮을수록 좋음)
+- `goal`: goal predictor loss (GoalPredictor가 얼마나 정확하게 목표 latent를 예측하는지)
 
 ### Resume Training
 
@@ -193,6 +208,16 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 /home/choi/StateVLA/train.p
   --phase1_checkpoint checkpoints/phase1_XXXXXXXX_XXXXXX/checkpoint_best.pt \
   --checkpoint checkpoints/phase2_XXXXXXXX_XXXXXX/checkpoint_latest.pt \
   2>&1 | tee /home/choi/StateVLA/phase2_resume_ddp.log
+
+# Phase 2 resume with LR reset (when changing LR or optimizer state is stale)
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 /home/choi/StateVLA/train.py \
+  --config /home/choi/StateVLA/conf/config.yaml \
+  --phase 2 \
+  --batch_size 128 \
+  --phase1_checkpoint checkpoints/phase1_XXXXXXXX_XXXXXX/checkpoint_best.pt \
+  --checkpoint checkpoints/phase2_XXXXXXXX_XXXXXX/checkpoint_latest.pt \
+  --reset_optimizer \
+  2>&1 | tee /home/choi/StateVLA/phase2_resume_reset_ddp.log
 ```
 
 ---
@@ -221,21 +246,24 @@ model:
   d_conv: 4                     # Mamba convolution width
   expand: 2                     # Mamba expansion factor
   state_dim: 256                # State representation z_t dim
-  action_dim: 7                 # 6 pos/rot + 1 gripper
+  action_dim: 7                 # pos(3) + rot(3) + gripper(1), unified 7D
   action_seq_len: 10            # Action chunk length
+  goal_predictor_hidden_dim: 512  # GoalPredictor hidden dim
   policy_layers: 3              # Flow Matching Mamba layers
   policy_embed_dim: 256         # Flow Matching hidden dim
 
 training:
-  batch_size: 256               # Per-GPU: 128 (DDP 2GPU → effective 256)
+  batch_size: 128
   learning_rate: 1.0e-4
   weight_decay: 0.05
   gradient_clip: 1.0
   ema_momentum: 0.996
   ema_momentum_schedule: "cosine"
-  world_model_loss_weight: 0.1  # Phase 2 world model consistency
+  world_model_loss_weight: 0.0  # Disabled (replaced by GoalPredictor)
+  goal_loss_weight: 0.1         # Phase 2: GoalPredictor target loss weight
   use_lr_scheduler: true        # CosineAnnealingLR
   min_lr: 5.0e-6
+  val_interval: 1               # Validate every epoch
   save_interval: 200            # epoch checkpoint 저장 간격
 
   phase1:
@@ -245,7 +273,8 @@ training:
 
   phase2:
     num_epochs: 3000
-    learning_rate: 5.0e-5
+    learning_rate: 1.0e-5
+    scheduler_epochs: 3000      # CosineAnnealingLR T_max
 ```
 
 ---
@@ -326,6 +355,16 @@ pip install mamba-ssm --no-build-isolation
 
 - Phase 1 체크포인트가 제대로 로드되었는지 확인
 - Encoder가 frozen인지 확인 (학습 로그에 trainable parameter count)
+- LR이 너무 크면 val loss가 발산할 수 있음 → `phase2.learning_rate: 1.0e-5`
+
+### Phase 2 Val Loss Increasing After Resume
+
+Adam optimizer state (v_t)가 이전 LR 기준으로 calibrated되어 있어 LR 변경 시 instability 발생.
+
+```bash
+# --reset_optimizer 플래그로 optimizer state 초기화
+torchrun ... --reset_optimizer
+```
 
 ---
 
@@ -333,13 +372,13 @@ pip install mamba-ssm --no-build-isolation
 
 | File | Description |
 |------|-------------|
-| `train.py` | Training script (`--phase 1` / `--phase 2`), DDP 지원 |
+| `train.py` | Training script (`--phase 1` / `--phase 2`), DDP 지원, `--reset_optimizer` |
 | `run_libero_eval.py` | LIBERO simulation evaluation |
-| `statevla_model.py` | StateVLA + StateVLATrainer (two-phase routing) |
+| `statevla_model.py` | StateVLA + StateVLATrainer (two-phase routing) + GoalPredictor |
 | `state_encoder.py` | JEPAStateEncoder (tokenizer + encoder + temporal predictor) |
-| `action_policy.py` | FlowMatchingPolicy + GripperClassifier |
+| `action_policy.py` | FlowMatchingPolicy (goal-conditioned, all 7D) |
 | `jepa/tokenizer.py` | Multi-modal tokenizer (SigLIP + CLIP + Robot → Mamba) |
 | `jepa/encoder.py` | Context Encoder (Mamba) + Target Encoder (EMA) |
 | `jepa/temporal_predictor.py` | z_t + a_t → z'_{t+1} + VICReg loss |
-| `dataloader.py` | Dataset loading + action normalization (pos/rot only) |
+| `dataloader.py` | Dataset loading + min-max action normalization (all 7D) |
 | `conf/config.yaml` | Training configuration |

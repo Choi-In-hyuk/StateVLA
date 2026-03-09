@@ -51,8 +51,8 @@ class FlowMatchingPolicy(nn.Module):
         if ssm_cfg is None:
             ssm_cfg = {"layer": "Mamba1", "d_state": 64, "d_conv": 4, "expand": 2}
 
-        # State projection
-        self.state_proj = nn.Linear(state_dim, embed_dim)
+        # State projection: takes concat([z_t, z_goal]) → state_dim * 2
+        self.state_proj = nn.Linear(state_dim * 2, embed_dim)
 
         # Action embedding
         self.action_emb = nn.Linear(action_dim, embed_dim)
@@ -92,7 +92,7 @@ class FlowMatchingPolicy(nn.Module):
 
     def forward(
         self,
-        z_next_pred: torch.Tensor,
+        z_state: torch.Tensor,
         noisy_actions: torch.Tensor,
         sigma: torch.Tensor,
         spatial_features: torch.Tensor = None,
@@ -101,16 +101,16 @@ class FlowMatchingPolicy(nn.Module):
         Forward pass for training (predicts velocity for flow matching).
 
         Args:
-            z_next_pred: [B, state_dim] predicted next state
+            z_state: [B, state_dim * 2] concat([z_t, z_goal])
             noisy_actions: [B, action_seq_len, action_dim] noisy/interpolated actions
             sigma: [B] diffusion timestep
-            spatial_features: [B, 392, embed_dim] image patch features (optional)
+            spatial_features: [B, N_patches, embed_dim] image patch features (optional)
 
         Returns:
             velocity: [B, action_seq_len, action_dim] predicted velocity
         """
         # Embed state: [B, 1, embed_dim]
-        state_emb = self.state_proj(z_next_pred).unsqueeze(1)
+        state_emb = self.state_proj(z_state).unsqueeze(1)
 
         # Embed timestep: [B, 1, embed_dim]
         sigma_emb = self.sigma_emb(sigma)
@@ -144,21 +144,21 @@ class FlowMatchingPolicy(nn.Module):
 
     @torch.no_grad()
     def generate(
-        self, z_next_pred: torch.Tensor, sample_steps: int = 4, cfg_scale: float = 1.0,
+        self, z_state: torch.Tensor, sample_steps: int = 4, cfg_scale: float = 1.0,
         spatial_features: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Generate actions using flow matching sampling.
 
         Args:
-            z_next_pred: [B, state_dim] predicted next state
+            z_state: [B, state_dim * 2] concat([z_t, z_goal])
             sample_steps: number of denoising steps
 
         Returns:
             actions: [B, action_seq_len, action_dim] generated actions
         """
-        batch_size = z_next_pred.shape[0]
-        device = z_next_pred.device
+        batch_size = z_state.shape[0]
+        device = z_state.device
 
         # Start from noise
         actions = torch.randn(
@@ -173,7 +173,7 @@ class FlowMatchingPolicy(nn.Module):
             sigma = torch.full((batch_size,), t, device=device)
 
             # Predict velocity
-            velocity = self.forward(z_next_pred, actions, sigma, spatial_features=spatial_features)
+            velocity = self.forward(z_state, actions, sigma, spatial_features=spatial_features)
 
             # Update actions (Euler step)
             actions = actions - step_size * velocity
@@ -300,8 +300,7 @@ class ActionPolicy(nn.Module):
     def forward(
         self,
         z_t: torch.Tensor,
-        z_next_pred: torch.Tensor,
-        error: torch.Tensor,
+        z_goal: torch.Tensor,
         noisy_actions: torch.Tensor,
         sigma: torch.Tensor,
         spatial_features: torch.Tensor = None,
@@ -311,20 +310,19 @@ class ActionPolicy(nn.Module):
 
         Args:
             z_t: [B, state_dim] current state
-            z_next_pred: [B, state_dim] predicted next state
-            error: [B, state_dim] prediction error
+            z_goal: [B, state_dim] predicted goal state (from GoalPredictor)
             noisy_actions: [B, action_seq_len, action_dim] noisy actions (7 dims)
             sigma: [B] diffusion timestep
-            spatial_features: [B, 392, embed_dim] image patch features (optional)
+            spatial_features: [B, N_patches, embed_dim] image patch features (optional)
 
         Returns:
             velocity: [B, action_seq_len, action_dim] predicted velocity
         """
-        # Base policy velocity for all 7 dims
-        velocity = self.base_policy(z_next_pred, noisy_actions, sigma, spatial_features=spatial_features)
+        z_state = torch.cat([z_t, z_goal], dim=-1)  # [B, state_dim * 2]
+        velocity = self.base_policy(z_state, noisy_actions, sigma, spatial_features=spatial_features)
 
-        # Add correction if enabled
         if self.use_correction and self.correction is not None:
+            error = z_goal - z_t  # goal direction as correction signal
             delta_a = self.correction(z_t, error)
             velocity = velocity + self.correction_weight * delta_a
 
@@ -334,8 +332,7 @@ class ActionPolicy(nn.Module):
     def generate_actions(
         self,
         z_t: torch.Tensor,
-        z_next_pred: torch.Tensor,
-        error: torch.Tensor,
+        z_goal: torch.Tensor,
         sample_steps: int = 4,
         spatial_features: torch.Tensor = None,
     ) -> torch.Tensor:
@@ -344,13 +341,9 @@ class ActionPolicy(nn.Module):
 
         Args:
             z_t: [B, state_dim] current state
-            z_next_pred: [B, state_dim] predicted next state
-            error: [B, state_dim] prediction error
+            z_goal: [B, state_dim] predicted goal state
             sample_steps: number of denoising steps
-            spatial_features: [B, 392, embed_dim] image patch features (optional)
-
-        Returns:
-            actions: [B, action_seq_len, action_dim] generated actions (7 dims)
+            spatial_features: [B, N_patches, embed_dim] image patch features (optional)
         """
         batch_size = z_t.shape[0]
         device = z_t.device
@@ -364,7 +357,7 @@ class ActionPolicy(nn.Module):
         for i in range(sample_steps, 0, -1):
             t = i / sample_steps
             sigma = torch.full((batch_size,), t, device=device)
-            velocity = self.forward(z_t, z_next_pred, error, actions, sigma,
+            velocity = self.forward(z_t, z_goal, actions, sigma,
                                     spatial_features=spatial_features)
             actions = actions - step_size * velocity
 
@@ -388,8 +381,8 @@ class ActionFlowMatching(nn.Module):
         self,
         actions: torch.Tensor,
         z_t: torch.Tensor,
-        z_next_pred: torch.Tensor,
-        error: torch.Tensor,
+        z_goal: torch.Tensor,
+        spatial_features: torch.Tensor = None,
     ) -> tuple:
         """
         Compute unified flow matching loss for all 7 action dims.
@@ -397,13 +390,11 @@ class ActionFlowMatching(nn.Module):
         Args:
             actions: [B, action_seq_len, action_dim] ground truth actions (7 dims)
             z_t: [B, state_dim] current state
-            z_next_pred: [B, state_dim] predicted next state
-            error: [B, state_dim] prediction error
+            z_goal: [B, state_dim] predicted goal state (from GoalPredictor)
+            spatial_features: [B, N_patches, embed_dim] optional spatial features
 
         Returns:
-            total_loss: flow matching MSE loss
-            flow_loss: same as total_loss
-            zero: placeholder (always 0.0, for API compatibility)
+            (flow_loss, sigma): flow matching MSE loss and sampled sigma
         """
         batch_size = actions.shape[0]
         device = actions.device
@@ -425,7 +416,8 @@ class ActionFlowMatching(nn.Module):
         interpolated = (1 - time_expanded) * actions + time_expanded * noise
 
         # Predict velocity
-        velocity_pred = self.policy(z_t, z_next_pred, error, interpolated, time_steps)
+        velocity_pred = self.policy(z_t, z_goal, interpolated, time_steps,
+                                    spatial_features=spatial_features)
 
         # Target velocity: noise - actions
         target_velocity = noise - actions
@@ -433,17 +425,16 @@ class ActionFlowMatching(nn.Module):
         # MSE loss for all 7 dims
         flow_loss = ((target_velocity - velocity_pred) ** 2).mean()
 
-        return flow_loss, flow_loss, torch.tensor(0.0, device=device)
+        return flow_loss, time_steps
 
     @torch.no_grad()
     def generate_actions(
         self,
         z_t: torch.Tensor,
-        z_next_pred: torch.Tensor,
-        error: torch.Tensor,
+        z_goal: torch.Tensor,
         sample_steps: int = 4,
+        spatial_features: torch.Tensor = None,
     ) -> torch.Tensor:
-        """
-        Generate actions using the policy.
-        """
-        return self.policy.generate_actions(z_t, z_next_pred, error, sample_steps)
+        """Generate actions using the policy."""
+        return self.policy.generate_actions(z_t, z_goal, sample_steps,
+                                            spatial_features=spatial_features)

@@ -321,7 +321,7 @@ def load_model(checkpoint_path, config_path, device):
         image_size=model_config.get("image_size", 224),
         patch_size=model_config.get("patch_size", 16),
         embed_dim=model_config.get("embed_dim", 256),
-        lang_emb_dim=model_config.get("lang_emb_dim", 3584),
+        lang_emb_dim=model_config.get("lang_emb_dim", 512),
         robot_state_dim=model_config.get("robot_state_dim", 9),
         use_pretrained_vision=model_config.get("use_pretrained_vision", False),
         use_pretrained_language=model_config.get("use_pretrained_language", False),
@@ -343,6 +343,7 @@ def load_model(checkpoint_path, config_path, device):
         policy_layers=model_config.get("policy_layers", 3),
         policy_embed_dim=model_config.get("policy_embed_dim", 256),
         temporal_hidden_dim=training_config.get("phase1", {}).get("temporal_predictor_hidden_dim", 512),
+        goal_predictor_hidden_dim=model_config.get("goal_predictor_hidden_dim", 512),
         training_phase=2,
         device=device,
     )

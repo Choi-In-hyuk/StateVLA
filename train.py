@@ -99,6 +99,8 @@ def save_checkpoint(
     is_best: bool = False,
     save_epoch_checkpoint: bool = False,
     best_train_loss: float = float('inf'),
+    val_loss: float = None,
+    best_val_loss: float = float('inf'),
 ):
     """Save model checkpoint with scheduler state (only on rank 0)."""
     if not is_main_process():
@@ -115,6 +117,8 @@ def save_checkpoint(
         'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
         'loss': loss,
         'best_train_loss': best_train_loss,
+        'val_loss': val_loss,
+        'best_val_loss': best_val_loss,
         'config': config,
     }
 
@@ -124,7 +128,7 @@ def save_checkpoint(
     if is_best:
         path = os.path.join(checkpoint_dir, 'checkpoint_best.pt')
         torch.save(checkpoint, path)
-        log.info(f"New best checkpoint at epoch {epoch} (train_loss: {loss:.4f})")
+        log.info(f"New best checkpoint at epoch {epoch} (val_loss: {val_loss:.4f})")
 
     if save_epoch_checkpoint:
         path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch}.pt')
@@ -243,7 +247,7 @@ def val_epoch_phase1(trainer, dataloader, device):
 def train_epoch_phase2(trainer, dataloader, optimizer, device, epoch, config, global_step=0, total_steps=0):
     """Train Phase 2: Flow Matching."""
     trainer.train()
-    total_loss = total_pos_rot = total_gripper = total_world_model = 0
+    total_loss = total_pos_rot = total_gripper = total_goal = 0
     num_batches = 0
     current_step = global_step
 
@@ -253,13 +257,13 @@ def train_epoch_phase2(trainer, dataloader, optimizer, device, epoch, config, gl
         obs = {k: v.to(device) for k, v in batch['obs'].items()}
         actions = batch['actions'].to(device)
 
-        next_obs = batch.get('next_obs')
-        if next_obs is not None:
-            next_obs = {k: v.to(device) for k, v in next_obs.items()}
+        goal_obs = batch.get('goal_obs')
+        if goal_obs is not None:
+            goal_obs = {k: v.to(device) for k, v in goal_obs.items()}
 
         optimizer.zero_grad()
         trainer_module = trainer.module if isinstance(trainer, DDP) else trainer
-        outputs = trainer_module(obs_dict=obs, gt_actions=actions, next_obs_dict=next_obs)
+        outputs = trainer_module(obs_dict=obs, gt_actions=actions, goal_obs_dict=goal_obs)
 
         loss = outputs['loss']
         loss.backward()
@@ -273,14 +277,14 @@ def train_epoch_phase2(trainer, dataloader, optimizer, device, epoch, config, gl
         total_loss += loss.item()
         total_pos_rot += outputs['pos_rot_loss'].item()
         total_gripper += outputs['gripper_loss'].item()
-        total_world_model += outputs.get('world_model_loss', torch.tensor(0.0)).item()
+        total_goal += outputs.get('goal_loss', torch.tensor(0.0)).item()
         num_batches += 1
 
         if is_main_process():
             pbar.set_postfix({
                 'loss': f"{loss.item():.4f}",
                 'flow7d': f"{outputs['pos_rot_loss'].item():.4f}",
-                'wm': f"{outputs.get('world_model_loss', torch.tensor(0.0)).item():.4f}",
+                'goal': f"{outputs.get('goal_loss', torch.tensor(0.0)).item():.4f}",
             })
 
     n = max(num_batches, 1)
@@ -288,7 +292,7 @@ def train_epoch_phase2(trainer, dataloader, optimizer, device, epoch, config, gl
         'loss': total_loss / n,
         'pos_rot_loss': total_pos_rot / n,
         'gripper_loss': total_gripper / n,
-        'world_model_loss': total_world_model / n,
+        'goal_loss': total_goal / n,
         'global_step': current_step,
     }
 
@@ -304,12 +308,12 @@ def val_epoch_phase2(trainer, dataloader, device):
         obs = {k: v.to(device) for k, v in batch['obs'].items()}
         actions = batch['actions'].to(device)
 
-        next_obs = batch.get('next_obs')
-        if next_obs is not None:
-            next_obs = {k: v.to(device) for k, v in next_obs.items()}
+        goal_obs = batch.get('goal_obs')
+        if goal_obs is not None:
+            goal_obs = {k: v.to(device) for k, v in goal_obs.items()}
 
         trainer_module = trainer.module if isinstance(trainer, DDP) else trainer
-        outputs = trainer_module(obs_dict=obs, gt_actions=actions, next_obs_dict=next_obs)
+        outputs = trainer_module(obs_dict=obs, gt_actions=actions, goal_obs_dict=goal_obs)
 
         total_loss += outputs['loss'].item()
         num_batches += 1
@@ -338,6 +342,8 @@ def main():
     parser.add_argument('--data_directory', type=str, default=None)
     parser.add_argument('--device', type=str, default=None)
     parser.add_argument('--batch_size', type=int, default=None)
+    parser.add_argument('--reset_optimizer', action='store_true',
+                        help='Reset optimizer state (useful when resuming with different LR)')
     args = parser.parse_args()
 
     local_rank = setup_ddp()
@@ -361,7 +367,8 @@ def main():
     set_seed(config.get('seed', 42) + get_rank())
 
     phase = args.phase
-    phase_config = config['training'].get(f'phase{phase}', {})
+    training_config = config['training']
+    phase_config = training_config.get(f'phase{phase}', {})
 
     if is_main_process():
         log.info(f"=== Phase {phase} Training ===")
@@ -383,22 +390,39 @@ def main():
         language_embedding_path=config['data'].get('language_embedding_path', None),
     )
 
+    # Train/val split
+    val_ratio = training_config.get('val_ratio', 0.1)
+    n_total = len(dataset)
+    n_val = int(n_total * val_ratio)
+    n_train = n_total - n_val
+    all_indices = list(range(n_total))
+    train_dataset = Subset(dataset, all_indices[:n_train])
+    val_dataset = Subset(dataset, all_indices[n_train:])
+
     if is_main_process():
-        log.info(f"Dataset: {len(dataset)} samples (no val split - using full dataset)")
+        log.info(f"Dataset: {n_total} total → {n_train} train / {n_val} val")
 
     batch_size = config['training']['batch_size']
     num_workers = 4
 
     if is_ddp():
-        train_sampler = DistributedSampler(dataset, num_replicas=get_world_size(),
+        train_sampler = DistributedSampler(train_dataset, num_replicas=get_world_size(),
                                            rank=get_rank(), shuffle=True)
-        train_loader = DataLoader(dataset, batch_size=batch_size, sampler=train_sampler,
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler,
                                   num_workers=num_workers, pin_memory=True,
                                   drop_last=True, collate_fn=collate_fn)
+        val_sampler = DistributedSampler(val_dataset, num_replicas=get_world_size(),
+                                         rank=get_rank(), shuffle=False)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, sampler=val_sampler,
+                                num_workers=num_workers, pin_memory=True,
+                                drop_last=False, collate_fn=collate_fn)
     else:
-        train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
                                   num_workers=num_workers, pin_memory=True,
                                   drop_last=True, collate_fn=collate_fn)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                                num_workers=num_workers, pin_memory=True,
+                                drop_last=False, collate_fn=collate_fn)
 
     # ── Model ─────────────────────────────────────────────────────────────────
     if is_main_process():
@@ -434,11 +458,11 @@ def main():
         policy_layers=model_config.get('policy_layers', 3),
         policy_embed_dim=model_config.get('policy_embed_dim', 256),
         temporal_hidden_dim=phase_config.get('temporal_predictor_hidden_dim', 512),
+        goal_predictor_hidden_dim=model_config.get('goal_predictor_hidden_dim', 512),
         training_phase=phase,
         device=init_device,
     )
 
-    training_config = config['training']
     trainer = StateVLATrainer(
         model=model,
         jepa_loss_weight=training_config.get('jepa_loss_weight', 1.0),
@@ -448,35 +472,42 @@ def main():
         ema_momentum=training_config.get('ema_momentum', 0.996),
         ema_momentum_schedule=training_config.get('ema_momentum_schedule', 'cosine'),
         world_model_loss_weight=training_config.get('world_model_loss_weight', 0.0),
+        goal_loss_weight=training_config.get('goal_loss_weight', 0.1),
     )
     trainer = trainer.to(device)
 
     # Action normalization stats (computed from full dataset - no val split)
     action_stats = dataset.get_action_stats()
     trainer.model.set_action_stats(
-        action_stats['mean'].to(device),
-        action_stats['std'].to(device),
+        action_stats['min'].to(device),
+        action_stats['max'].to(device),
     )
 
     # ── Phase 2: load Phase 1 encoder ────────────────────────────────────────
     if phase == 2:
         phase1_ckpt_path = args.phase1_checkpoint or phase_config.get('phase1_checkpoint')
-        if phase1_ckpt_path is None:
-            log.error("Phase 2 requires --phase1_checkpoint")
+        if phase1_ckpt_path is None and args.checkpoint is None:
+            log.error("Phase 2 requires --phase1_checkpoint (or --checkpoint to resume)")
             cleanup_ddp()
             return
 
-        if is_main_process():
-            log.info(f"Loading Phase 1 checkpoint: {phase1_ckpt_path}")
-        phase1_ckpt = torch.load(phase1_ckpt_path, map_location=device)
+        if phase1_ckpt_path is not None:
+            if is_main_process():
+                log.info(f"Loading Phase 1 checkpoint: {phase1_ckpt_path}")
+            phase1_ckpt = torch.load(phase1_ckpt_path, map_location=device)
 
-        current_state = trainer.state_dict()
-        filtered = {k: v for k, v in phase1_ckpt['model_state_dict'].items()
-                    if not (k in current_state and current_state[k].shape != v.shape)}
-        trainer.load_state_dict(filtered, strict=False)
-        trainer.model.freeze_encoder()
-        if is_main_process():
-            log.info("Phase 1 encoder loaded and frozen")
+            current_state = trainer.state_dict()
+            filtered = {k: v for k, v in phase1_ckpt['model_state_dict'].items()
+                        if not (k in current_state and current_state[k].shape != v.shape)}
+            trainer.load_state_dict(filtered, strict=False)
+            trainer.model.freeze_encoder()
+            if is_main_process():
+                log.info("Phase 1 encoder loaded and frozen")
+        else:
+            # Freeze encoder before optimizer creation so param groups match saved checkpoint
+            trainer.model.freeze_encoder()
+            if is_main_process():
+                log.info("Resuming Phase 2 — encoder frozen, weights will be loaded from Phase 2 checkpoint")
 
     total_params = sum(p.numel() for p in trainer.parameters())
     trainable_params = sum(p.numel() for p in trainer.parameters() if p.requires_grad)
@@ -515,6 +546,7 @@ def main():
     # ── Resume from checkpoint ────────────────────────────────────────────────
     start_epoch = 0
     best_train_loss = float('inf')
+    best_val_loss = float('inf')
 
     if args.checkpoint:
         if is_main_process():
@@ -526,34 +558,50 @@ def main():
         filtered = {k: v for k, v in ckpt['model_state_dict'].items()
                     if not (k in current_state and current_state[k].shape != v.shape)}
         model_to_load.load_state_dict(filtered, strict=False)
-        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        if args.reset_optimizer:
+            if is_main_process():
+                log.info("Optimizer state reset (--reset_optimizer): starting fresh with new LR")
+        else:
+            try:
+                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            except (ValueError, RuntimeError) as e:
+                if is_main_process():
+                    log.warning(f"Optimizer state not loaded (architecture changed): {e}")
+                    log.warning("Starting optimizer from scratch — LR will be restored via scheduler")
 
         # Restore scheduler state (correct LR position after resume)
         if scheduler is not None:
             loaded = False
-            if ckpt.get('scheduler_state_dict') is not None:
-                try:
-                    scheduler.load_state_dict(ckpt['scheduler_state_dict'])
-                    loaded = True
+            saved_sched = ckpt.get('scheduler_state_dict')
+            if saved_sched is not None:
+                # If T_max changed, skip loading to start a fresh cosine schedule
+                saved_T_max = saved_sched.get('T_max')
+                current_T_max = getattr(scheduler, 'T_max', None)
+                if saved_T_max is not None and saved_T_max != current_T_max:
                     if is_main_process():
-                        log.info("Scheduler state restored from checkpoint")
-                except (KeyError, ValueError):
-                    if is_main_process():
-                        log.info("Scheduler type changed — advancing manually instead")
+                        log.info(f"Scheduler T_max changed ({saved_T_max} → {current_T_max}) — starting fresh LR schedule")
+                else:
+                    try:
+                        scheduler.load_state_dict(saved_sched)
+                        loaded = True
+                        if is_main_process():
+                            log.info("Scheduler state restored from checkpoint")
+                    except (KeyError, ValueError):
+                        if is_main_process():
+                            log.info("Scheduler type changed — starting fresh LR schedule")
             if not loaded:
-                for _ in range(ckpt['epoch'] + 1):
-                    scheduler.step()
                 if is_main_process():
-                    log.info(f"Scheduler manually advanced to epoch {ckpt['epoch'] + 1}")
+                    log.info(f"Fresh LR schedule: {scheduler.get_last_lr()} over {getattr(scheduler, 'T_max', '?')} epochs")
 
         start_epoch = ckpt['epoch'] + 1
         best_train_loss = ckpt.get('best_train_loss', float('inf'))
+        best_val_loss = ckpt.get('best_val_loss', float('inf'))
 
         if phase == 2:
             model_to_load.model.freeze_encoder()
 
         if is_main_process():
-            log.info(f"Resumed from epoch {start_epoch}, best_train_loss={best_train_loss:.4f}")
+            log.info(f"Resumed from epoch {start_epoch}, best_train_loss={best_train_loss:.4f}, best_val_loss={best_val_loss:.4f}")
             if scheduler is not None:
                 log.info(f"Current LR: {scheduler.get_last_lr()[0]:.2e}")
 
@@ -567,12 +615,14 @@ def main():
     total_steps = num_epochs * steps_per_epoch
     global_step = start_epoch * steps_per_epoch
     save_interval = training_config.get('save_interval', 200)
+    val_interval = training_config.get('val_interval', 10)
 
     train_fn = train_epoch_phase1 if phase == 1 else train_epoch_phase2
+    val_fn = val_epoch_phase1 if phase == 1 else val_epoch_phase2
 
     if is_main_process():
         log.info(f"Epochs: {num_epochs}, steps/epoch: {steps_per_epoch}, total: {total_steps}")
-        log.info(f"Epoch checkpoint every {save_interval} epochs")
+        log.info(f"Validation every {val_interval} epochs, epoch checkpoint every {save_interval} epochs")
 
     for epoch in range(start_epoch, num_epochs):
         if is_ddp():
@@ -594,27 +644,39 @@ def main():
         if scheduler is not None:
             scheduler.step()
 
+        # Validate (all ranks must participate for DDP all_reduce)
+        val_loss = None
+        if (epoch + 1) % val_interval == 0:
+            val_loss = val_fn(trainer, val_loader, device)
+
         # ── Logging & Checkpoint (main process only) ──────────────────────────
         if is_main_process():
             current_lr = scheduler.get_last_lr()[0] if scheduler else lr
             if phase == 1:
-                log.info(
+                log_msg = (
                     f"Epoch {epoch} | train_loss={train_metrics['loss']:.4f} "
                     f"mse={train_metrics['jepa_mse']:.4f} "
                     f"var={train_metrics['jepa_variance']:.4f} "
                     f"lr={current_lr:.2e}"
                 )
             else:
-                log.info(
+                log_msg = (
                     f"Epoch {epoch} | train_loss={train_metrics['loss']:.4f} "
                     f"flow7d={train_metrics['pos_rot_loss']:.4f} "
-                    f"wm={train_metrics.get('world_model_loss', 0.0):.4f} "
+                    f"goal={train_metrics.get('goal_loss', 0.0):.4f} "
                     f"lr={current_lr:.2e}"
                 )
+            if val_loss is not None:
+                log_msg += f" | val_loss={val_loss:.4f}"
+            log.info(log_msg)
 
             save_epoch_ckpt = (epoch + 1) % save_interval == 0
-            is_best = train_metrics['loss'] < best_train_loss
+            # Best checkpoint based on val_loss (only updated on val epochs)
+            is_best = val_loss is not None and val_loss < best_val_loss
             if is_best:
+                best_val_loss = val_loss
+            # Track train loss separately
+            if train_metrics['loss'] < best_train_loss:
                 best_train_loss = train_metrics['loss']
             save_checkpoint(
                 model=trainer, optimizer=optimizer, scheduler=scheduler,
@@ -623,6 +685,8 @@ def main():
                 is_best=is_best,
                 save_epoch_checkpoint=save_epoch_ckpt,
                 best_train_loss=best_train_loss,
+                val_loss=val_loss,
+                best_val_loss=best_val_loss,
             )
 
         if is_ddp():
